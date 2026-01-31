@@ -496,13 +496,14 @@ app.post('/setup/onboard', requireAuth, validateCSRF, async (req, res) => {
       });
     }
 
-    // Map provider to auth choice, API key flag, default model id, and env var name for .env
+    // Map provider to auth choice and CLI flag (match upstream / openclaw onboard expectations).
+    // Auth choice values must match what openclaw onboard --auth-choice accepts (e.g. minimax-api, not minimax-api-key).
     const providerConfig = {
       anthropic: { authChoice: 'apiKey', flag: '--anthropic-api-key', primaryModel: 'anthropic/claude-opus-4-5', envVar: 'ANTHROPIC_API_KEY' },
       openai: { authChoice: 'openai-api-key', flag: '--openai-api-key', primaryModel: 'openai/gpt-4o', envVar: 'OPENAI_API_KEY' },
-      google: { authChoice: 'google-api-key', flag: '--google-api-key', primaryModel: 'google/gemini-2.0-flash', envVar: 'GOOGLE_API_KEY' },
+      google: { authChoice: 'gemini-api-key', flag: '--google-api-key', primaryModel: 'google/gemini-2.0-flash', envVar: 'GOOGLE_API_KEY' },
       openrouter: { authChoice: 'openrouter-api-key', flag: '--openrouter-api-key', primaryModel: 'openrouter/anthropic/claude-sonnet-4', envVar: 'OPENROUTER_API_KEY' },
-      minimax: { authChoice: 'minimax-api-key', flag: '--minimax-api-key', primaryModel: 'minimax/MiniMax-M2.1', envVar: 'MINIMAX_API_KEY' },
+      minimax: { authChoice: 'minimax-api', flag: '--minimax-api-key', primaryModel: 'minimax/MiniMax-M2.1', envVar: 'MINIMAX_API_KEY' },
       groq: { authChoice: 'groq-api-key', flag: '--groq-api-key', primaryModel: 'groq/llama-4-scout-17b-16e-instruct', envVar: 'GROQ_API_KEY' },
       xai: { authChoice: 'xai-api-key', flag: '--xai-api-key', primaryModel: 'xai/grok-3-mini', envVar: 'XAI_API_KEY' }
     };
@@ -535,29 +536,34 @@ app.post('/setup/onboard', requireAuth, validateCSRF, async (req, res) => {
       addLog(`Config warning: ${configErr.message}`);
     }
 
-    // Run onboard without starting the gateway first. If the gateway were running,
-    // config writes during onboard would trigger restarts and the probe would see
-    // token_mismatch (gateway may have reloaded with a different token). Running
-    // onboard with no gateway avoids that; we start the gateway after.
+    // Run onboard without starting the gateway first. Pass gateway options so onboard
+    // writes config that matches our wrapper (loopback, token). We start the gateway after.
     const onboardArgs = [
       'onboard',
       '--non-interactive',
       '--accept-risk',
       '--json',
       '--flow', 'quickstart',
+      '--gateway-bind', 'loopback',
+      '--gateway-port', String(GATEWAY_PORT),
+      '--gateway-auth', 'token',
+      '--gateway-token', gatewayToken,
       '--auth-choice', config.authChoice,
       config.flag, apiKey
     ];
 
     try {
-      const result = execSync(`openclaw ${onboardArgs.join(' ')}`, {
+      const onboardProc = spawn('openclaw', onboardArgs, {
         env: onboardEnv,
-        encoding: 'utf-8',
-        timeout: 120000,
-        stdio: ['pipe', 'pipe', 'pipe']
+        stdio: ['ignore', 'pipe', 'pipe']
       });
-      addLog('Onboard completed successfully');
-      addLog(result.substring(0, 200));
+      onboardProc.stdout?.on('data', (d) => addLog(d.toString().trim()));
+      onboardProc.stderr?.on('data', (d) => addLog(d.toString().trim()));
+      const exitCode = await new Promise((resolve) => {
+        onboardProc.on('close', (code) => resolve(code ?? 0));
+      });
+      if (exitCode === 0) addLog('Onboard completed successfully');
+      else addLog(`Onboard exited with code ${exitCode}`);
     } catch (onboardErr) {
       addLog(`Onboard warning: ${onboardErr.message}`);
       // Continue even if onboard fails - config was already set
