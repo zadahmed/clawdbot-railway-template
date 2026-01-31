@@ -496,15 +496,15 @@ app.post('/setup/onboard', requireAuth, validateCSRF, async (req, res) => {
       });
     }
 
-    // Map provider to auth choice and API key flag
+    // Map provider to auth choice, API key flag, and default model id for agents.defaults
     const providerConfig = {
-      anthropic: { authChoice: 'apiKey', flag: '--anthropic-api-key' },
-      openai: { authChoice: 'openai-api-key', flag: '--openai-api-key' },
-      google: { authChoice: 'google-api-key', flag: '--google-api-key' },
-      openrouter: { authChoice: 'openrouter-api-key', flag: '--openrouter-api-key' },
-      minimax: { authChoice: 'minimax-api-key', flag: '--minimax-api-key' },
-      groq: { authChoice: 'groq-api-key', flag: '--groq-api-key' },
-      xai: { authChoice: 'xai-api-key', flag: '--xai-api-key' }
+      anthropic: { authChoice: 'apiKey', flag: '--anthropic-api-key', primaryModel: 'anthropic/claude-opus-4-5' },
+      openai: { authChoice: 'openai-api-key', flag: '--openai-api-key', primaryModel: 'openai/gpt-4o' },
+      google: { authChoice: 'google-api-key', flag: '--google-api-key', primaryModel: 'google/gemini-2.0-flash' },
+      openrouter: { authChoice: 'openrouter-api-key', flag: '--openrouter-api-key', primaryModel: 'openrouter/anthropic/claude-sonnet-4' },
+      minimax: { authChoice: 'minimax-api-key', flag: '--minimax-api-key', primaryModel: 'minimax/MiniMax-M2.1' },
+      groq: { authChoice: 'groq-api-key', flag: '--groq-api-key', primaryModel: 'groq/llama-4-scout-17b-16e-instruct' },
+      xai: { authChoice: 'xai-api-key', flag: '--xai-api-key', primaryModel: 'xai/grok-3-mini' }
     };
 
     const config = providerConfig[provider];
@@ -563,7 +563,7 @@ app.post('/setup/onboard', requireAuth, validateCSRF, async (req, res) => {
       // Continue even if onboard fails - config was already set
     }
 
-    // Re-apply our token to openclaw.json so the gateway always uses it (onboard may overwrite)
+    // Re-apply our token and set default model to user's chosen provider so gateway uses it (onboard may overwrite)
     try {
       const openclawJsonPath = join(STATE_DIR, 'openclaw.json');
       if (existsSync(openclawJsonPath)) {
@@ -572,6 +572,18 @@ app.post('/setup/onboard', requireAuth, validateCSRF, async (req, res) => {
         if (!openclawConfig.gateway.auth) openclawConfig.gateway.auth = {};
         openclawConfig.gateway.auth.mode = 'token';
         openclawConfig.gateway.auth.token = gatewayToken;
+        // Set default model to the provider the user configured (avoids "No API key for anthropic")
+        const primaryModel = config.primaryModel;
+        if (primaryModel) {
+          if (!openclawConfig.agents) openclawConfig.agents = {};
+          if (!openclawConfig.agents.defaults) openclawConfig.agents.defaults = {};
+          openclawConfig.agents.defaults.model = openclawConfig.agents.defaults.model || {};
+          openclawConfig.agents.defaults.model.primary = primaryModel;
+          if (!openclawConfig.agents.defaults.models) openclawConfig.agents.defaults.models = {};
+          if (!openclawConfig.agents.defaults.models[primaryModel]) {
+            openclawConfig.agents.defaults.models[primaryModel] = {};
+          }
+        }
         writeFileSync(openclawJsonPath, JSON.stringify(openclawConfig, null, 2), { mode: 0o600 });
       }
     } catch (e) {
