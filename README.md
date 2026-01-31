@@ -227,6 +227,9 @@ Contributions are welcome! Please:
 - Check if your API key is valid
 - Look at the logs in the setup page
 
+### "Gateway closed (1006)" or "token_mismatch" during onboard
+- The setup wizard runs onboard **without** starting the gateway first, then starts the gateway afterward. This avoids the probe connecting to a gateway that is restarting (config writes) and seeing a token mismatch. The flow is: configure auth → run onboard → re-apply token in config → start gateway.
+
 ### Login not working
 - Verify your `SETUP_PASSWORD` environment variable
 - Clear browser cache and cookies
@@ -236,6 +239,10 @@ Contributions are welcome! Please:
 - Ensure you have a valid API key configured
 - Check Railway logs for errors
 - Try restarting the service
+
+### Dashboard shows "pairing required" or "unauthorized"
+- Always open the dashboard using the **"Open OpenClaw Dashboard"** link on the setup page (`/setup`). That link includes the auth token in the URL (`/openclaw?token=...`).
+- If you bookmarked or typed the URL without the token, go back to `/setup` and click the dashboard link again so the token is included.
 
 ## Resources
 

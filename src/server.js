@@ -131,7 +131,7 @@ async function startGateway() {
     const line = data.toString().trim();
     console.log(`[gateway] ${line}`);
     addLog(line);
-    if (line.includes('Gateway listening') || line.includes('ready')) {
+    if (line.includes('Gateway listening') || line.includes('listening') || line.includes('ready')) {
       gatewayReady = true;
     }
   });
@@ -510,40 +510,15 @@ app.post('/setup/onboard', requireAuth, validateCSRF, async (req, res) => {
     const config = providerConfig[provider];
     addLog(`Starting onboard for ${provider}...`);
 
-    // Build onboard command arguments
-    const onboardArgs = [
-      'onboard',
-      '--non-interactive',
-      '--accept-risk',
-      '--json',
-      '--flow', 'quickstart',
-      '--auth-choice', config.authChoice,
-      config.flag, apiKey
-    ];
-
-    // Run openclaw onboard
     const onboardEnv = {
       ...process.env,
       OPENCLAW_STATE_DIR: STATE_DIR,
       OPENCLAW_WORKSPACE_DIR: WORKSPACE_DIR,
-      OPENCLAW_NON_INTERACTIVE: '1'
+      OPENCLAW_NON_INTERACTIVE: '1',
+      OPENCLAW_GATEWAY_TOKEN: gatewayToken
     };
 
-    try {
-      const result = execSync(`openclaw ${onboardArgs.join(' ')}`, {
-        env: onboardEnv,
-        encoding: 'utf-8',
-        timeout: 120000,
-        stdio: ['pipe', 'pipe', 'pipe']
-      });
-      addLog('Onboard completed successfully');
-      addLog(result.substring(0, 200));
-    } catch (onboardErr) {
-      addLog(`Onboard warning: ${onboardErr.message}`);
-      // Continue even if onboard fails - we'll set config manually
-    }
-
-    // Configure gateway auth token
+    // Configure gateway auth token first
     try {
       execSync(`openclaw config set gateway.auth.mode token`, {
         env: onboardEnv,
@@ -558,6 +533,49 @@ app.post('/setup/onboard', requireAuth, validateCSRF, async (req, res) => {
       addLog('Gateway auth configured');
     } catch (configErr) {
       addLog(`Config warning: ${configErr.message}`);
+    }
+
+    // Run onboard without starting the gateway first. If the gateway were running,
+    // config writes during onboard would trigger restarts and the probe would see
+    // token_mismatch (gateway may have reloaded with a different token). Running
+    // onboard with no gateway avoids that; we start the gateway after.
+    const onboardArgs = [
+      'onboard',
+      '--non-interactive',
+      '--accept-risk',
+      '--json',
+      '--flow', 'quickstart',
+      '--auth-choice', config.authChoice,
+      config.flag, apiKey
+    ];
+
+    try {
+      const result = execSync(`openclaw ${onboardArgs.join(' ')}`, {
+        env: onboardEnv,
+        encoding: 'utf-8',
+        timeout: 120000,
+        stdio: ['pipe', 'pipe', 'pipe']
+      });
+      addLog('Onboard completed successfully');
+      addLog(result.substring(0, 200));
+    } catch (onboardErr) {
+      addLog(`Onboard warning: ${onboardErr.message}`);
+      // Continue even if onboard fails - config was already set
+    }
+
+    // Re-apply our token to openclaw.json so the gateway always uses it (onboard may overwrite)
+    try {
+      const openclawJsonPath = join(STATE_DIR, 'openclaw.json');
+      if (existsSync(openclawJsonPath)) {
+        const openclawConfig = JSON.parse(readFileSync(openclawJsonPath, 'utf-8'));
+        if (!openclawConfig.gateway) openclawConfig.gateway = {};
+        if (!openclawConfig.gateway.auth) openclawConfig.gateway.auth = {};
+        openclawConfig.gateway.auth.mode = 'token';
+        openclawConfig.gateway.auth.token = gatewayToken;
+        writeFileSync(openclawJsonPath, JSON.stringify(openclawConfig, null, 2), { mode: 0o600 });
+      }
+    } catch (e) {
+      // ignore
     }
 
     // Configure channels if provided
@@ -606,7 +624,7 @@ app.post('/setup/onboard', requireAuth, validateCSRF, async (req, res) => {
     console.log('[wrapper] Configuration saved');
     addLog('Configuration saved successfully');
 
-    // Start gateway
+    // Start gateway now (after onboard and token re-apply)
     await startGateway();
 
     res.json({
@@ -858,7 +876,8 @@ app.get('/setup/pairing/check/:code', (req, res) => {
 // Logs endpoint
 app.get('/setup/logs', requireAuth, (req, res) => {
   const tail = Math.min(parseInt(req.query.tail || '100', 10), 500);
-  res.json({ logs: gatewayLogs.slice(-tail) });
+  const logs = Array.isArray(gatewayLogs) ? gatewayLogs.slice(-tail) : [];
+  res.json({ logs });
 });
 
 // Backup export
@@ -939,6 +958,15 @@ app.use((req, res, next) => {
   }
 
   req.headers['x-gateway-token'] = gatewayToken;
+
+  // OpenClaw Control UI is served at / on the gateway. Rewrite /openclaw -> /
+  // so the dashboard loads and can read ?token= from the URL and store in localStorage.
+  if (req.path === '/openclaw' || req.path.startsWith('/openclaw/')) {
+    const query = req.url.includes('?') ? req.url.slice(req.url.indexOf('?')) : '';
+    const targetPath = req.path === '/openclaw' || req.path === '/openclaw/' ? '/' : req.path.slice('/openclaw'.length) || '/';
+    req.url = targetPath + query;
+  }
+
   proxy.web(req, res);
 });
 
@@ -954,6 +982,14 @@ server.on('upgrade', (req, socket, head) => {
     return;
   }
   req.headers['x-gateway-token'] = gatewayToken;
+  // Same path rewrite for WebSocket (dashboard live updates)
+  if (req.url && (req.url.startsWith('/openclaw') || req.url.startsWith('/openclaw/'))) {
+    const queryStart = req.url.indexOf('?');
+    const pathOnly = queryStart >= 0 ? req.url.slice(0, queryStart) : req.url;
+    const query = queryStart >= 0 ? req.url.slice(queryStart) : '';
+    const targetPath = pathOnly === '/openclaw' || pathOnly === '/openclaw/' ? '/' : pathOnly.slice('/openclaw'.length) || '/';
+    req.url = targetPath + query;
+  }
   proxy.ws(req, socket, head);
 });
 
@@ -1692,25 +1728,28 @@ function getSetupHTML(csrfToken, sessionId) {
     }
 
     async function refreshLogs() {
+      const logsEl = document.getElementById('logs');
+      if (!logsEl) return;
       try {
         const res = await secureFetch('/setup/logs?tail=50');
         const data = await res.json();
-        const logsEl = document.getElementById('logs');
-        if (data.logs.length === 0) {
+        const logs = Array.isArray(data?.logs) ? data.logs : [];
+        if (logs.length === 0) {
           logsEl.innerHTML = '<span class="text-slate-500">No activity yet. Your AI is waiting to be started.</span>';
         } else {
-          logsEl.innerHTML = data.logs.map(log => {
-            const isError = log.toLowerCase().includes('error') || log.includes('[stderr]');
-            const isSuccess = log.toLowerCase().includes('success') || log.toLowerCase().includes('ready') || log.toLowerCase().includes('listening');
+          logsEl.innerHTML = logs.map(log => {
+            const line = String(log);
+            const isError = line.toLowerCase().includes('error') || line.includes('[stderr]');
+            const isSuccess = line.toLowerCase().includes('success') || line.toLowerCase().includes('ready') || line.toLowerCase().includes('listening');
             let colorClass = 'text-slate-400';
             if (isError) colorClass = 'text-red-400';
             if (isSuccess) colorClass = 'text-emerald-400';
-            return '<div class="' + colorClass + ' py-0.5">' + log.replace(/</g, '&lt;').replace(/>/g, '&gt;') + '</div>';
+            return '<div class="' + colorClass + ' py-0.5">' + line.replace(/</g, '&lt;').replace(/>/g, '&gt;') + '</div>';
           }).join('');
           logsEl.scrollTop = logsEl.scrollHeight;
         }
       } catch (e) {
-        document.getElementById('logs').innerHTML = '<span class="text-red-400">Could not load activity log</span>';
+        logsEl.innerHTML = '<span class="text-red-400">Could not load activity log</span>';
       }
     }
 
@@ -1730,8 +1769,13 @@ function getSetupHTML(csrfToken, sessionId) {
       e.preventDefault();
       const btn = document.getElementById('submitBtn');
       const originalContent = btn.innerHTML;
+      const logsEl = document.getElementById('logs');
       btn.disabled = true;
       btn.innerHTML = '<span class="flex items-center justify-center gap-2"><svg class="w-5 h-5 animate-spin" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>Connecting...</span>';
+
+      // Poll activity log while connecting so user sees progress (e.g. "Starting onboard...", "Starting gateway...")
+      const logsInterval = setInterval(refreshLogs, 2000);
+      if (logsEl) logsEl.innerHTML = '<span class="text-slate-500">Connecting… activity will appear here as setup runs.</span>';
 
       try {
         const res = await secureFetch('/setup/onboard', {
@@ -1752,10 +1796,12 @@ function getSetupHTML(csrfToken, sessionId) {
           document.getElementById('apiKey').value = '';
         }
         checkStatus();
-        refreshLogs();
+        await refreshLogs();
       } catch (e) {
         showMessage('error', 'Connection failed. Please check your internet and try again.');
+        if (logsEl) await refreshLogs();
       } finally {
+        clearInterval(logsInterval);
         btn.disabled = false;
         btn.innerHTML = originalContent;
       }
