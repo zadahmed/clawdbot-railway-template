@@ -1,4 +1,4 @@
-# ClawdBot Railway Template
+# ClawdBot (OpenClaw) Railway Template
 
 [![Deploy on Railway](https://railway.app/button.svg)](https://railway.com/deploy/hogNz1?referralCode=kXOukk&utm_medium=integration&utm_source=template&utm_campaign=generic)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
