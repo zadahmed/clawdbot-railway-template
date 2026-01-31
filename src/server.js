@@ -133,6 +133,14 @@ async function startGateway() {
     minimax: 'MINIMAX_API_KEY'
   };
 
+  // Map provider to model string
+  const modelMap = {
+    anthropic: 'anthropic/claude-sonnet-4-20250514',
+    openai: 'openai/gpt-4o',
+    google: 'google/gemini-2.0-flash',
+    minimax: 'minimax/MiniMax-Text-01'
+  };
+
   const env = {
     ...process.env,
     OPENCLAW_STATE_DIR: STATE_DIR,
@@ -143,9 +151,14 @@ async function startGateway() {
     OPENCLAW_NON_INTERACTIVE: '1',
   };
 
-  // Add the API key to environment
+  // Add the API key and model to environment
   if (provider && apiKey && envVarMap[provider]) {
     env[envVarMap[provider]] = apiKey;
+  }
+
+  // Set the model
+  if (provider && modelMap[provider]) {
+    env.OPENCLAW_MODEL = modelMap[provider];
   }
 
   gatewayProcess = spawn('openclaw', ['gateway', '--allow-unconfigured'], {
@@ -485,6 +498,9 @@ app.get('/setup/status', requireAuth, (req, res) => {
     slack: channelsConfig.slack?.enabled || false
   };
 
+  // Generate tokenized dashboard URL
+  const dashboardToken = gatewayToken;
+
   res.json({
     gateway: gatewayReady ? 'running' : 'stopped',
     configured: config.configured || false,
@@ -492,6 +508,7 @@ app.get('/setup/status', requireAuth, (req, res) => {
     provider: config.provider || null,
     channels: channels,
     hasChannels: channels.telegram || channels.discord || channels.slack,
+    dashboardToken: gatewayReady ? dashboardToken : null,
     stateDir: STATE_DIR,
     csrfToken: req.session.csrfToken,
     sessionId: req.sessionId
@@ -1264,6 +1281,14 @@ function getSetupHTML(csrfToken, sessionId) {
             </span>
           </button>
         </div>
+        <!-- Dashboard Button -->
+        <div id="dashboardSection" class="hidden mt-4 pt-4 border-t border-slate-700/50">
+          <a id="dashboardLink" href="#" target="_blank" class="flex items-center justify-center gap-2 w-full py-3 rounded-xl bg-violet-500/10 border border-violet-500/20 text-violet-400 font-medium transition-all duration-200 hover:bg-violet-500/20 hover:border-violet-500/40">
+            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z"/></svg>
+            Open OpenClaw Dashboard
+          </a>
+          <p class="text-xs text-slate-500 text-center mt-2">Access the full OpenClaw control panel</p>
+        </div>
       </div>
 
       <!-- AI Provider Card -->
@@ -1614,6 +1639,9 @@ function getSetupHTML(csrfToken, sessionId) {
         // Update AI Provider card to show connected state
         updateProviderCard(data.configured, data.provider);
 
+        // Update Dashboard link
+        updateDashboardLink(data.gateway === 'running', data.dashboardToken);
+
         // Update CSRF token if provided
         if (data.csrfToken) {
           window.CSRF_TOKEN = data.csrfToken;
@@ -1650,6 +1678,21 @@ function getSetupHTML(csrfToken, sessionId) {
         form.classList.remove('hidden');
       } else {
         form.classList.add('hidden');
+      }
+    }
+
+    function updateDashboardLink(isRunning, token) {
+      const section = document.getElementById('dashboardSection');
+      const link = document.getElementById('dashboardLink');
+
+      if (isRunning && token) {
+        // Generate tokenized dashboard URL
+        const baseUrl = window.location.origin;
+        const dashboardUrl = baseUrl + '/openclaw?token=' + encodeURIComponent(token);
+        link.href = dashboardUrl;
+        section.classList.remove('hidden');
+      } else {
+        section.classList.add('hidden');
       }
     }
 
