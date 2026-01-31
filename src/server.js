@@ -96,6 +96,30 @@ function addLog(line) {
   if (gatewayLogs.length > MAX_LOGS) gatewayLogs.shift();
 }
 
+const GATEWAY_TARGET = `http://${GATEWAY_HOST}:${GATEWAY_PORT}`;
+
+async function waitForGatewayReady(opts = {}) {
+  const timeoutMs = opts.timeoutMs ?? 15_000;
+  const pollMs = opts.pollMs ?? 100;
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    try {
+      for (const path of ['/openclaw', '/', '/clawdbot']) {
+        try {
+          const res = await fetch(`${GATEWAY_TARGET}${path}`, { method: 'GET' });
+          if (res && res.status < 500) return true;
+        } catch {
+          // try next path
+        }
+      }
+    } catch {
+      // not ready
+    }
+    await new Promise((r) => setTimeout(r, pollMs));
+  }
+  return false;
+}
+
 async function startGateway() {
   if (gatewayProcess) {
     console.log('[wrapper] Gateway already running');
@@ -112,14 +136,14 @@ async function startGateway() {
     OPENCLAW_NON_INTERACTIVE: '1',
   };
 
-  // Gateway arguments matching reference implementation
   const gatewayArgs = [
     'gateway',
     'run',
     '--bind', 'loopback',
     '--port', String(GATEWAY_PORT),
     '--auth', 'token',
-    '--token', gatewayToken
+    '--token', gatewayToken,
+    '--allow-unconfigured'
   ];
 
   gatewayProcess = spawn('openclaw', gatewayArgs, {
@@ -149,12 +173,12 @@ async function startGateway() {
     gatewayReady = false;
   });
 
-  await new Promise((resolve) => {
-    const check = setInterval(() => {
-      if (gatewayReady) { clearInterval(check); resolve(); }
-    }, 100);
-    setTimeout(() => { clearInterval(check); resolve(); }, 30000);
-  });
+  // Fast readiness: poll HTTP as soon as gateway accepts connections (like vignesh07/clawdbot-railway-template)
+  const ready = await waitForGatewayReady({ timeoutMs: 15_000, pollMs: 100 });
+  if (ready) {
+    gatewayReady = true;
+    addLog('Gateway ready');
+  }
 }
 
 function stopGateway() {
@@ -169,7 +193,7 @@ function stopGateway() {
 
 async function restartGateway() {
   stopGateway();
-  await new Promise(r => setTimeout(r, 1000));
+  await new Promise(r => setTimeout(r, 750));
   await startGateway();
 }
 
@@ -536,13 +560,15 @@ app.post('/setup/onboard', requireAuth, validateCSRF, async (req, res) => {
       addLog(`Config warning: ${configErr.message}`);
     }
 
-    // Run onboard without starting the gateway first. Pass gateway options so onboard
-    // writes config that matches our wrapper (loopback, token). We start the gateway after.
+    // Run onboard without starting the gateway first (like vignesh07: --no-install-daemon --skip-health for speed).
     const onboardArgs = [
       'onboard',
       '--non-interactive',
       '--accept-risk',
       '--json',
+      '--no-install-daemon',
+      '--skip-health',
+      '--workspace', WORKSPACE_DIR,
       '--flow', 'quickstart',
       '--gateway-bind', 'loopback',
       '--gateway-port', String(GATEWAY_PORT),
@@ -576,6 +602,7 @@ app.post('/setup/onboard', requireAuth, validateCSRF, async (req, res) => {
         const openclawConfig = JSON.parse(readFileSync(openclawJsonPath, 'utf-8'));
         if (!openclawConfig.gateway) openclawConfig.gateway = {};
         if (!openclawConfig.gateway.auth) openclawConfig.gateway.auth = {};
+        openclawConfig.gateway.mode = 'local';
         openclawConfig.gateway.auth.mode = 'token';
         openclawConfig.gateway.auth.token = gatewayToken;
         // Trust our wrapper proxy so gateway accepts X-Forwarded-* and treats clients correctly (any public URL)
@@ -2207,10 +2234,11 @@ server.listen(PUBLIC_PORT, '0.0.0.0', () => {
       const openclawJsonPath = join(STATE_DIR, 'openclaw.json');
       if (existsSync(openclawJsonPath)) {
         const openclawConfig = JSON.parse(readFileSync(openclawJsonPath, 'utf-8'));
-        if (openclawConfig.gateway && !openclawConfig.gateway.trustedProxies?.length) {
-          openclawConfig.gateway.trustedProxies = ['127.0.0.1', '::1'];
+        if (openclawConfig.gateway) {
+          if (!openclawConfig.gateway.mode) openclawConfig.gateway.mode = 'local';
+          if (!openclawConfig.gateway.trustedProxies?.length) openclawConfig.gateway.trustedProxies = ['127.0.0.1', '::1'];
           writeFileSync(openclawJsonPath, JSON.stringify(openclawConfig, null, 2), { mode: 0o600 });
-          console.log('[wrapper] Set gateway.trustedProxies for proxy detection');
+          console.log('[wrapper] Set gateway.mode and trustedProxies for proxy detection');
         }
       }
     } catch (e) {}
