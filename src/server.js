@@ -105,6 +105,34 @@ async function startGateway() {
   console.log('[wrapper] Starting OpenClaw gateway...');
   addLog('Starting gateway...');
 
+  // Load API key from config if available
+  const configPath = join(STATE_DIR, 'config.json');
+  const authProfilesPath = join(STATE_DIR, 'agents', 'default', 'agent', 'auth-profiles.json');
+  let apiKey = '';
+  let provider = '';
+
+  if (existsSync(configPath)) {
+    try {
+      const config = JSON.parse(readFileSync(configPath, 'utf-8'));
+      provider = config.provider || '';
+    } catch (e) {}
+  }
+
+  if (existsSync(authProfilesPath)) {
+    try {
+      const authProfiles = JSON.parse(readFileSync(authProfilesPath, 'utf-8'));
+      apiKey = authProfiles.default?.apiKey || '';
+    } catch (e) {}
+  }
+
+  // Set the appropriate API key environment variable
+  const envVarMap = {
+    anthropic: 'ANTHROPIC_API_KEY',
+    openai: 'OPENAI_API_KEY',
+    google: 'GOOGLE_API_KEY',
+    minimax: 'MINIMAX_API_KEY'
+  };
+
   const env = {
     ...process.env,
     OPENCLAW_STATE_DIR: STATE_DIR,
@@ -115,7 +143,12 @@ async function startGateway() {
     OPENCLAW_NON_INTERACTIVE: '1',
   };
 
-  gatewayProcess = spawn('openclaw', ['gateway'], {
+  // Add the API key to environment
+  if (provider && apiKey && envVarMap[provider]) {
+    env[envVarMap[provider]] = apiKey;
+  }
+
+  gatewayProcess = spawn('openclaw', ['gateway', '--allow-unconfigured'], {
     env,
     stdio: ['ignore', 'pipe', 'pipe'],
   });
