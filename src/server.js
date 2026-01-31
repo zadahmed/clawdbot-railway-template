@@ -1026,6 +1026,58 @@ app.get('/setup/pairing/check/:code', (req, res) => {
   res.json({ approved: false, pending: true });
 });
 
+// Approve channel pairing (Telegram/Discord/Slack: user DMs bot, gets code, owner approves here)
+app.post('/setup/pairing/approve-channel', requireAuth, validateCSRF, (req, res) => {
+  try {
+    const { channel, code } = req.body;
+    if (!channel || !code) {
+      return res.status(400).json({
+        error: 'Channel and code required',
+        message: 'Please select a channel (Telegram, Discord, or Slack) and enter the pairing code.'
+      });
+    }
+    const channelName = String(channel).toLowerCase().trim();
+    if (!['telegram', 'discord', 'slack'].includes(channelName)) {
+      return res.status(400).json({
+        error: 'Invalid channel',
+        message: 'Channel must be telegram, discord, or slack.'
+      });
+    }
+    const pairingCode = String(code).trim();
+    if (!pairingCode) {
+      return res.status(400).json({
+        error: 'Code required',
+        message: 'Please enter the pairing code (e.g. the one the bot sent in DM).'
+      });
+    }
+    const approveEnv = {
+      ...process.env,
+      OPENCLAW_STATE_DIR: STATE_DIR,
+      OPENCLAW_WORKSPACE_DIR: WORKSPACE_DIR,
+      OPENCLAW_NON_INTERACTIVE: '1'
+    };
+    execFileSync('openclaw', ['pairing', 'approve', channelName, pairingCode], {
+      env: approveEnv,
+      encoding: 'utf-8',
+      timeout: 15000
+    });
+    addLog(`Pairing approved for ${channelName}`);
+    res.json({
+      success: true,
+      message: `Approved! They can now use the bot on ${channelName}.`
+    });
+  } catch (err) {
+    const msg = err.stderr || err.stdout || err.message || '';
+    addLog(`Pairing approve failed: ${msg}`);
+    res.status(500).json({
+      error: 'Approve failed',
+      message: msg.includes('not found') || msg.includes('invalid') || msg.includes('expired')
+        ? 'That pairing code is invalid or expired. Ask them to start a new DM with the bot.'
+        : `Could not approve: ${String(err.message)}`
+    });
+  }
+});
+
 // Logs endpoint
 app.get('/setup/logs', requireAuth, (req, res) => {
   const tail = Math.min(parseInt(req.query.tail || '100', 10), 500);
@@ -1584,35 +1636,38 @@ function getSetupHTML(csrfToken, sessionId) {
         </div>
       </div>
 
-      <!-- Device Pairing Card -->
+      <!-- Approve channel pairing (Telegram/Discord/Slack: user DMs bot, gets code, owner approves here) -->
       <div class="glass rounded-2xl p-6 mb-6 transition-all duration-300 glass-hover">
         <div class="flex items-center gap-3 mb-6">
           <div class="w-10 h-10 rounded-xl bg-gradient-to-br from-green-500/20 to-emerald-500/20 flex items-center justify-center">
             <svg class="w-5 h-5 text-green-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 18h.01M8 21h8a2 2 0 002-2V5a2 2 0 00-2-2H8a2 2 0 00-2 2v14a2 2 0 002 2z"/>
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"/>
             </svg>
           </div>
           <div>
-            <h2 class="text-lg font-semibold text-white">Connect a New Device</h2>
-            <p class="text-sm text-slate-400">Pair your phone or other devices to chat with your AI</p>
+            <h2 class="text-lg font-semibold text-white">Approve pairing</h2>
+            <p class="text-sm text-slate-400">When someone DMs your bot (Telegram, Discord, Slack), they get a pairing code. Enter it here to approve them.</p>
           </div>
         </div>
         <div class="space-y-4">
           <div>
-            <label for="deviceName" class="block text-sm font-medium text-slate-300 mb-2">What device are you connecting?</label>
-            <input type="text" id="deviceName" placeholder="e.g., My iPhone, Work Laptop" class="w-full px-4 py-3 rounded-xl bg-slate-800/50 border border-slate-700/50 text-white placeholder-slate-500 transition-all duration-200 focus:outline-none focus:border-violet-500/50 input-glow hover:border-slate-600">
+            <label for="pairingChannel" class="block text-sm font-medium text-slate-300 mb-2">Channel</label>
+            <select id="pairingChannel" class="w-full px-4 py-3 rounded-xl bg-slate-800/50 border border-slate-700/50 text-white appearance-none cursor-pointer transition-all duration-200 focus:outline-none focus:border-violet-500/50 input-glow">
+              <option value="telegram">Telegram</option>
+              <option value="discord">Discord</option>
+              <option value="slack">Slack</option>
+            </select>
           </div>
-          <button onclick="generatePairingCode()" class="w-full py-3 rounded-xl bg-green-500/10 border border-green-500/20 text-green-400 font-medium transition-all duration-200 hover:bg-green-500/20 hover:border-green-500/40">
+          <div>
+            <label for="pairingCodeInput" class="block text-sm font-medium text-slate-300 mb-2">Pairing code</label>
+            <input type="text" id="pairingCodeInput" placeholder="e.g. RS7BRZMC (from the bot DM)" class="w-full px-4 py-3 rounded-xl bg-slate-800/50 border border-slate-700/50 text-white placeholder-slate-500 transition-all duration-200 focus:outline-none focus:border-violet-500/50 input-glow font-mono uppercase" maxlength="12">
+          </div>
+          <button type="button" onclick="approveChannelPairing()" id="approvePairingBtn" class="w-full py-3 rounded-xl bg-green-500/10 border border-green-500/20 text-green-400 font-medium transition-all duration-200 hover:bg-green-500/20 hover:border-green-500/40">
             <span class="flex items-center justify-center gap-2">
-              <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"/></svg>
-              Generate Pairing Code
+              <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/></svg>
+              Approve
             </span>
           </button>
-          <div id="pairingCode" class="hidden text-center p-6 rounded-xl bg-slate-900/50 border border-slate-700/50">
-            <p class="text-sm text-slate-400 mb-2">Enter this code on your device:</p>
-            <p id="pairingCodeValue" class="text-3xl font-mono font-bold text-violet-400 tracking-widest"></p>
-            <p class="text-xs text-slate-500 mt-2">Code expires in 5 minutes</p>
-          </div>
         </div>
       </div>
 
@@ -2006,28 +2061,33 @@ function getSetupHTML(csrfToken, sessionId) {
       }
     }
 
-    async function generatePairingCode() {
-      const deviceName = document.getElementById('deviceName').value;
-      if (!deviceName || deviceName.length < 2) {
-        showMessage('error', 'Please enter a name for your device (e.g., "My iPhone")');
+    async function approveChannelPairing() {
+      const channel = document.getElementById('pairingChannel').value;
+      const code = (document.getElementById('pairingCodeInput').value || '').trim().toUpperCase();
+      if (!code) {
+        showMessage('error', 'Please enter the pairing code (e.g. from the bot DM).');
         return;
       }
-
+      const btn = document.getElementById('approvePairingBtn');
+      btn.disabled = true;
+      btn.innerHTML = '<span class="flex items-center justify-center gap-2"><svg class="w-5 h-5 animate-spin" fill="none" stroke="currentColor" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>Approving...</span>';
       try {
-        const res = await secureFetch('/setup/pairing/generate', {
+        const res = await secureFetch('/setup/pairing/approve-channel', {
           method: 'POST',
-          body: JSON.stringify({ deviceName })
+          body: JSON.stringify({ channel, code })
         });
         const data = await res.json();
         if (data.success) {
-          document.getElementById('pairingCode').classList.remove('hidden');
-          document.getElementById('pairingCodeValue').textContent = data.code;
           showMessage('success', data.message);
+          document.getElementById('pairingCodeInput').value = '';
         } else {
-          showMessage('error', data.message || 'Could not generate pairing code');
+          showMessage('error', data.message || data.error || 'Could not approve.');
         }
       } catch (e) {
-        showMessage('error', 'Could not generate pairing code. Please try again.');
+        showMessage('error', 'Could not approve. Please try again.');
+      } finally {
+        btn.disabled = false;
+        btn.innerHTML = '<span class="flex items-center justify-center gap-2"><svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/></svg>Approve</span>';
       }
     }
 
