@@ -292,7 +292,8 @@ function requireAuth(req, res, next) {
     });
   }
 
-  const sessionId = req.headers['x-session-id'];
+  // Check session from header, query param, or cookie
+  const sessionId = req.headers['x-session-id'] || req.query.session;
   const ip = getClientIP(req);
 
   if (sessionId) {
@@ -889,7 +890,8 @@ function getLoginHTML() {
           // Store session in localStorage
           localStorage.setItem('openclaw_session', data.sessionId);
           localStorage.setItem('openclaw_csrf', data.csrfToken);
-          window.location.href = '/setup';
+          // Redirect with session in URL for initial page load
+          window.location.href = '/setup?session=' + encodeURIComponent(data.sessionId);
         } else {
           errorEl.textContent = data.message || 'Invalid password';
           errorEl.classList.remove('hidden');
@@ -905,13 +907,18 @@ function getLoginHTML() {
     });
 
     // Check if already logged in
+    // Check if already logged in
     const session = localStorage.getItem('openclaw_session');
     if (session) {
       fetch('/setup/status', {
         headers: { 'X-Session-Id': session }
       }).then(res => {
-        if (res.ok) window.location.href = '/setup';
-      }).catch(() => {});
+        if (res.ok) window.location.href = '/setup?session=' + encodeURIComponent(session);
+      }).catch(() => {
+        // Session invalid, clear it
+        localStorage.removeItem('openclaw_session');
+        localStorage.removeItem('openclaw_csrf');
+      });
     }
   </script>
 </body>
