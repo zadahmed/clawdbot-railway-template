@@ -19,7 +19,7 @@
 import express from 'express';
 import http from 'http';
 import httpProxy from 'http-proxy';
-import { spawn, execSync } from 'child_process';
+import { spawn, execSync, execFileSync } from 'child_process';
 import { existsSync, readFileSync, writeFileSync, mkdirSync, rmSync, unlinkSync } from 'fs';
 import { join } from 'path';
 import { randomBytes, createHash, timingSafeEqual } from 'crypto';
@@ -569,7 +569,7 @@ app.post('/setup/onboard', requireAuth, validateCSRF, async (req, res) => {
       // Continue even if onboard fails - config was already set
     }
 
-    // Re-apply our token and set default model to user's chosen provider so gateway uses it (onboard may overwrite)
+    // Re-apply our token, trustedProxies, and default model so gateway uses them (onboard may overwrite)
     try {
       const openclawJsonPath = join(STATE_DIR, 'openclaw.json');
       if (existsSync(openclawJsonPath)) {
@@ -578,6 +578,8 @@ app.post('/setup/onboard', requireAuth, validateCSRF, async (req, res) => {
         if (!openclawConfig.gateway.auth) openclawConfig.gateway.auth = {};
         openclawConfig.gateway.auth.mode = 'token';
         openclawConfig.gateway.auth.token = gatewayToken;
+        // Trust our wrapper proxy so gateway accepts X-Forwarded-* and treats clients correctly (any public URL)
+        openclawConfig.gateway.trustedProxies = ['127.0.0.1', '::1'];
         // Set default model to the provider the user configured (avoids "No API key for anthropic")
         const primaryModel = config.primaryModel;
         if (primaryModel) {
@@ -632,34 +634,84 @@ app.post('/setup/onboard', requireAuth, validateCSRF, async (req, res) => {
       addLog(`paste-token warning: ${pasteErr.message}`);
     }
 
-    // Configure channels if provided
+    // Configure channels if provided (same shape as vignesh07/clawdbot-railway-template: botToken, dmPolicy, etc.)
+    // Only set channel config if this openclaw build supports it (channels add --help lists the channel).
     if (channels && (channels.telegram || channels.discord || channels.slack)) {
       const channelsPath = join(STATE_DIR, 'channels.json');
       const channelsConfig = existsSync(channelsPath) ? JSON.parse(readFileSync(channelsPath, 'utf-8')) : {};
+      let channelsHelp = '';
+      try {
+        channelsHelp = execSync('openclaw channels add --help', { env: onboardEnv, encoding: 'utf-8', timeout: 5000 });
+      } catch (e) {}
+      const supports = (name) => (channelsHelp || '').includes(name);
 
       if (channels.telegram) {
-        channelsConfig.telegram = { enabled: true, token: channels.telegram };
-        // Also configure via CLI
-        try {
-          const telegramConfig = JSON.stringify({ enabled: true, token: channels.telegram });
-          execSync(`openclaw config set channels.telegram '${telegramConfig}'`, {
-            env: onboardEnv,
-            encoding: 'utf-8',
-            timeout: 10000
-          });
-        } catch (e) {}
-        addLog('Telegram channel configured');
+        const token = String(channels.telegram).trim();
+        channelsConfig.telegram = { enabled: true, token };
+        if (supports('telegram')) {
+          try {
+            const payload = JSON.stringify({
+              enabled: true,
+              dmPolicy: 'pairing',
+              botToken: token,
+              groupPolicy: 'allowlist',
+              streamMode: 'partial'
+            });
+            execFileSync('openclaw', ['config', 'set', '--json', 'channels.telegram', payload], {
+              env: onboardEnv,
+              encoding: 'utf-8',
+              timeout: 10000
+            });
+            addLog('Telegram channel configured');
+          } catch (e) {}
+        } else {
+          addLog('Telegram skipped (build does not list telegram in channels add --help)');
+        }
       }
 
       if (channels.discord) {
-        channelsConfig.discord = { enabled: true, token: channels.discord };
-        addLog('Discord channel configured');
+        const token = String(channels.discord).trim();
+        channelsConfig.discord = { enabled: true, token };
+        if (supports('discord')) {
+          try {
+            const payload = JSON.stringify({
+              enabled: true,
+              token,
+              groupPolicy: 'allowlist',
+              dm: { policy: 'pairing' }
+            });
+            execFileSync('openclaw', ['config', 'set', '--json', 'channels.discord', payload], {
+              env: onboardEnv,
+              encoding: 'utf-8',
+              timeout: 10000
+            });
+            addLog('Discord channel configured');
+          } catch (e) {}
+        } else {
+          addLog('Discord skipped (build does not list discord in channels add --help)');
+        }
       }
 
       if (channels.slack) {
-        channelsConfig.slack = { enabled: true, token: channels.slack
-        };
-        addLog('Slack channel configured');
+        const token = String(channels.slack).trim();
+        channelsConfig.slack = { enabled: true, token };
+        if (supports('slack')) {
+          try {
+            const payload = JSON.stringify({
+              enabled: true,
+              botToken: token,
+              appToken: undefined
+            });
+            execFileSync('openclaw', ['config', 'set', '--json', 'channels.slack', payload], {
+              env: onboardEnv,
+              encoding: 'utf-8',
+              timeout: 10000
+            });
+            addLog('Slack channel configured');
+          } catch (e) {}
+        } else {
+          addLog('Slack skipped (build does not list slack in channels add --help)');
+        }
       }
 
       writeFileSync(channelsPath, JSON.stringify(channelsConfig, null, 2), { mode: 0o600 });
@@ -702,34 +754,76 @@ app.post('/setup/channels', requireAuth, validateCSRF, async (req, res) => {
 
     const channelsPath = join(STATE_DIR, 'channels.json');
     const channelsConfig = existsSync(channelsPath) ? JSON.parse(readFileSync(channelsPath, 'utf-8')) : {};
+    const channelEnv = {
+      ...process.env,
+      OPENCLAW_STATE_DIR: STATE_DIR,
+      OPENCLAW_WORKSPACE_DIR: WORKSPACE_DIR,
+      OPENCLAW_NON_INTERACTIVE: '1'
+    };
 
-    // Update only provided channels
+    // Update only provided channels (and push same shape to OpenClaw config so dashboard shows Configured/Running)
     if (telegram !== undefined) {
       if (telegram) {
-        channelsConfig.telegram = { enabled: true, token: sanitizeInput(telegram) };
+        const token = sanitizeInput(telegram);
+        channelsConfig.telegram = { enabled: true, token };
+        try {
+          execFileSync('openclaw', ['config', 'set', '--json', 'channels.telegram', JSON.stringify({
+            enabled: true,
+            dmPolicy: 'pairing',
+            botToken: token,
+            groupPolicy: 'allowlist',
+            streamMode: 'partial'
+          })], { env: channelEnv, encoding: 'utf-8', timeout: 10000 });
+        } catch (e) {}
         addLog('Telegram channel updated');
       } else {
         delete channelsConfig.telegram;
+        try {
+          execFileSync('openclaw', ['config', 'set', '--json', 'channels.telegram', '{}'], { env: channelEnv, encoding: 'utf-8', timeout: 10000 });
+        } catch (e) {}
         addLog('Telegram channel removed');
       }
     }
 
     if (discord !== undefined) {
       if (discord) {
-        channelsConfig.discord = { enabled: true, token: sanitizeInput(discord) };
+        const token = sanitizeInput(discord);
+        channelsConfig.discord = { enabled: true, token };
+        try {
+          execFileSync('openclaw', ['config', 'set', '--json', 'channels.discord', JSON.stringify({
+            enabled: true,
+            token,
+            groupPolicy: 'allowlist',
+            dm: { policy: 'pairing' }
+          })], { env: channelEnv, encoding: 'utf-8', timeout: 10000 });
+        } catch (e) {}
         addLog('Discord channel updated');
       } else {
         delete channelsConfig.discord;
+        try {
+          execFileSync('openclaw', ['config', 'set', '--json', 'channels.discord', '{}'], { env: channelEnv, encoding: 'utf-8', timeout: 10000 });
+        } catch (e) {}
         addLog('Discord channel removed');
       }
     }
 
     if (slack !== undefined) {
       if (slack) {
-        channelsConfig.slack = { enabled: true, token: sanitizeInput(slack) };
+        const token = sanitizeInput(slack);
+        channelsConfig.slack = { enabled: true, token };
+        try {
+          execFileSync('openclaw', ['config', 'set', '--json', 'channels.slack', JSON.stringify({
+            enabled: true,
+            botToken: token,
+            appToken: undefined
+          })], { env: channelEnv, encoding: 'utf-8', timeout: 10000 });
+        } catch (e) {}
         addLog('Slack channel updated');
       } else {
         delete channelsConfig.slack;
+        try {
+          execFileSync('openclaw', ['config', 'set', '--json', 'channels.slack', '{}'], { env: channelEnv, encoding: 'utf-8', timeout: 10000 });
+        } catch (e) {}
         addLog('Slack channel removed');
       }
     }
@@ -742,6 +836,11 @@ app.post('/setup/channels', requireAuth, validateCSRF, async (req, res) => {
       const config = JSON.parse(readFileSync(configPath, 'utf-8'));
       config.hasChannels = Object.keys(channelsConfig).length > 0;
       writeFileSync(configPath, JSON.stringify(config, null, 2), { mode: 0o600 });
+    }
+
+    // Restart gateway so it reloads channel config (matches vignesh07/clawdbot-railway-template)
+    if (gatewayProcess) {
+      await restartGateway();
     }
 
     // Build response
@@ -2043,6 +2142,18 @@ server.listen(PUBLIC_PORT, '0.0.0.0', () => {
 
   if (existsSync(join(STATE_DIR, 'config.json'))) {
     console.log('[wrapper] Found existing config, starting gateway...');
+    // Ensure gateway.trustedProxies is set for existing configs (wrapper runs in front; any public URL)
+    try {
+      const openclawJsonPath = join(STATE_DIR, 'openclaw.json');
+      if (existsSync(openclawJsonPath)) {
+        const openclawConfig = JSON.parse(readFileSync(openclawJsonPath, 'utf-8'));
+        if (openclawConfig.gateway && !openclawConfig.gateway.trustedProxies?.length) {
+          openclawConfig.gateway.trustedProxies = ['127.0.0.1', '::1'];
+          writeFileSync(openclawJsonPath, JSON.stringify(openclawConfig, null, 2), { mode: 0o600 });
+          console.log('[wrapper] Set gateway.trustedProxies for proxy detection');
+        }
+      }
+    } catch (e) {}
     startGateway().catch(err => {
       console.error('[wrapper] Failed to auto-start gateway:', err);
     });
