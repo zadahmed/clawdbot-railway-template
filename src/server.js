@@ -584,6 +584,82 @@ app.post('/setup/onboard', requireAuth, validateCSRF, async (req, res) => {
   }
 });
 
+// Update channels separately
+app.post('/setup/channels', requireAuth, validateCSRF, async (req, res) => {
+  try {
+    const { telegram, discord, slack } = req.body;
+
+    const channelsPath = join(STATE_DIR, 'channels.json');
+    const channelsConfig = existsSync(channelsPath) ? JSON.parse(readFileSync(channelsPath, 'utf-8')) : {};
+
+    // Update only provided channels
+    if (telegram !== undefined) {
+      if (telegram) {
+        channelsConfig.telegram = { enabled: true, token: sanitizeInput(telegram) };
+        addLog('Telegram channel updated');
+      } else {
+        delete channelsConfig.telegram;
+        addLog('Telegram channel removed');
+      }
+    }
+
+    if (discord !== undefined) {
+      if (discord) {
+        channelsConfig.discord = { enabled: true, token: sanitizeInput(discord) };
+        addLog('Discord channel updated');
+      } else {
+        delete channelsConfig.discord;
+        addLog('Discord channel removed');
+      }
+    }
+
+    if (slack !== undefined) {
+      if (slack) {
+        channelsConfig.slack = { enabled: true, token: sanitizeInput(slack) };
+        addLog('Slack channel updated');
+      } else {
+        delete channelsConfig.slack;
+        addLog('Slack channel removed');
+      }
+    }
+
+    writeFileSync(channelsPath, JSON.stringify(channelsConfig, null, 2), { mode: 0o600 });
+
+    // Update config.json
+    const configPath = join(STATE_DIR, 'config.json');
+    if (existsSync(configPath)) {
+      const config = JSON.parse(readFileSync(configPath, 'utf-8'));
+      config.hasChannels = Object.keys(channelsConfig).length > 0;
+      writeFileSync(configPath, JSON.stringify(config, null, 2), { mode: 0o600 });
+    }
+
+    // Build response
+    const connectedChannels = [];
+    if (channelsConfig.telegram?.enabled) connectedChannels.push('Telegram');
+    if (channelsConfig.discord?.enabled) connectedChannels.push('Discord');
+    if (channelsConfig.slack?.enabled) connectedChannels.push('Slack');
+
+    res.json({
+      success: true,
+      message: connectedChannels.length > 0
+        ? `Channels updated: ${connectedChannels.join(', ')}`
+        : 'All channels disconnected',
+      channels: {
+        telegram: !!channelsConfig.telegram?.enabled,
+        discord: !!channelsConfig.discord?.enabled,
+        slack: !!channelsConfig.slack?.enabled
+      }
+    });
+  } catch (err) {
+    console.error('[wrapper] Channel update error:', err);
+    addLog(`Channel update error: ${err.message}`);
+    res.status(500).json({
+      error: 'Update failed',
+      message: `Could not update channels: ${err.message}`
+    });
+  }
+});
+
 // Reset setup - clears all configuration
 app.post('/setup/reset', requireAuth, validateCSRF, async (req, res) => {
   try {
@@ -1158,8 +1234,8 @@ function getSetupHTML(csrfToken, sessionId) {
       </div>
 
       <!-- AI Provider Card -->
-      <div class="glass rounded-2xl p-6 mb-6 transition-all duration-300 glass-hover">
-        <div class="flex items-center gap-3 mb-6">
+      <div id="providerCard" class="glass rounded-2xl p-6 mb-6 transition-all duration-300 glass-hover">
+        <div class="flex items-center gap-3 mb-4">
           <div class="w-10 h-10 rounded-xl bg-gradient-to-br from-violet-500/20 to-purple-500/20 flex items-center justify-center">
             <svg class="w-5 h-5 text-violet-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z"/>
@@ -1170,6 +1246,10 @@ function getSetupHTML(csrfToken, sessionId) {
             <p class="text-sm text-slate-400">Choose your preferred AI provider and enter your API key</p>
           </div>
         </div>
+        <!-- Connected Status (shown when configured) -->
+        <div id="providerConnectedStatus" class="hidden mb-4"></div>
+        <!-- Form (can be toggled) -->
+        <div id="providerFormContainer">
         <form id="setupForm" class="space-y-5">
           <div>
             <label for="provider" class="block text-sm font-medium text-slate-300 mb-2">Which AI do you want to use?</label>
@@ -1223,6 +1303,7 @@ function getSetupHTML(csrfToken, sessionId) {
             </span>
           </button>
         </form>
+        </div>
       </div>
 
       <!-- Channels Card -->
@@ -1258,6 +1339,18 @@ function getSetupHTML(csrfToken, sessionId) {
             </label>
             <input type="password" id="slackToken" placeholder="Get this from Slack App settings" class="w-full px-4 py-3 rounded-xl bg-slate-800/50 border border-slate-700/50 text-white placeholder-slate-500 transition-all duration-200 focus:outline-none focus:border-violet-500/50 input-glow hover:border-slate-600">
           </div>
+          <!-- Channel Status -->
+          <div id="channelStatus" class="hidden p-3 rounded-lg bg-slate-800/30 border border-slate-700/30">
+            <p class="text-xs text-slate-400 mb-2">Connected channels:</p>
+            <div class="flex flex-wrap gap-2" id="connectedChannels"></div>
+          </div>
+          <!-- Save Channels Button -->
+          <button type="button" onclick="saveChannels()" id="saveChannelsBtn" class="w-full py-3 rounded-xl bg-blue-500/10 border border-blue-500/20 text-blue-400 font-medium transition-all duration-200 hover:bg-blue-500/20 hover:border-blue-500/40 disabled:opacity-50">
+            <span class="flex items-center justify-center gap-2">
+              <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7H5a2 2 0 00-2 2v9a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-3m-1 4l-3 3m0 0l-3-3m3 3V4"/></svg>
+              Save Channel Settings
+            </span>
+          </button>
         </div>
       </div>
 
@@ -1480,6 +1573,14 @@ function getSetupHTML(csrfToken, sessionId) {
 
         updateSteps(data.configured, data.gateway === 'running');
 
+        // Update channel status
+        if (data.channels) {
+          updateChannelStatus(data.channels);
+        }
+
+        // Update AI Provider card to show connected state
+        updateProviderCard(data.configured, data.provider);
+
         // Update CSRF token if provided
         if (data.csrfToken) {
           window.CSRF_TOKEN = data.csrfToken;
@@ -1491,6 +1592,31 @@ function getSetupHTML(csrfToken, sessionId) {
         }
       } catch (e) {
         console.error('Status check failed:', e);
+      }
+    }
+
+    function updateProviderCard(configured, provider) {
+      const providerCard = document.getElementById('providerCard');
+      const providerForm = document.getElementById('providerFormContainer');
+      const providerStatus = document.getElementById('providerConnectedStatus');
+
+      if (!providerCard) return;
+
+      const providerNames = { anthropic: 'Claude', openai: 'GPT', google: 'Gemini', minimax: 'MiniMax' };
+      const providerName = provider ? providerNames[provider] || provider : '';
+
+      if (configured && providerStatus) {
+        providerStatus.innerHTML = '<div class="flex items-center justify-between p-4 rounded-xl bg-emerald-500/10 border border-emerald-500/20"><div class="flex items-center gap-3"><div class="w-8 h-8 rounded-lg bg-emerald-500/20 flex items-center justify-center"><svg class="w-4 h-4 text-emerald-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/></svg></div><div><p class="text-sm font-medium text-emerald-400">Connected to ' + providerName + '</p><p class="text-xs text-slate-400">Click below to change provider</p></div></div><button type="button" onclick="toggleProviderForm()" class="text-xs text-slate-400 hover:text-white transition-colors">Edit</button></div>';
+        providerStatus.classList.remove('hidden');
+      }
+    }
+
+    function toggleProviderForm() {
+      const form = document.getElementById('providerFormContainer');
+      if (form.classList.contains('hidden')) {
+        form.classList.remove('hidden');
+      } else {
+        form.classList.add('hidden');
       }
     }
 
@@ -1575,6 +1701,52 @@ function getSetupHTML(csrfToken, sessionId) {
         btn.innerHTML = originalContent;
       }
     });
+
+    async function saveChannels() {
+      const btn = document.getElementById('saveChannelsBtn');
+      const originalContent = btn.innerHTML;
+      btn.disabled = true;
+      btn.innerHTML = '<span class="flex items-center justify-center gap-2"><svg class="w-5 h-5 animate-spin" fill="none" stroke="currentColor" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>Saving...</span>';
+
+      try {
+        const res = await secureFetch('/setup/channels', {
+          method: 'POST',
+          body: JSON.stringify({
+            telegram: document.getElementById('telegramToken').value || '',
+            discord: document.getElementById('discordToken').value || '',
+            slack: document.getElementById('slackToken').value || ''
+          })
+        });
+        const data = await res.json();
+        showMessage(data.success ? 'success' : 'error', data.message);
+        if (data.success) {
+          updateChannelStatus(data.channels);
+        }
+        checkStatus();
+      } catch (e) {
+        showMessage('error', 'Could not save channels. Please try again.');
+      } finally {
+        btn.disabled = false;
+        btn.innerHTML = originalContent;
+      }
+    }
+
+    function updateChannelStatus(channels) {
+      const statusDiv = document.getElementById('channelStatus');
+      const connectedDiv = document.getElementById('connectedChannels');
+      const connected = [];
+
+      if (channels.telegram) connected.push('<span class="px-2 py-1 rounded bg-blue-500/20 text-blue-400 text-xs">📱 Telegram</span>');
+      if (channels.discord) connected.push('<span class="px-2 py-1 rounded bg-indigo-500/20 text-indigo-400 text-xs">🎮 Discord</span>');
+      if (channels.slack) connected.push('<span class="px-2 py-1 rounded bg-purple-500/20 text-purple-400 text-xs">💼 Slack</span>');
+
+      if (connected.length > 0) {
+        connectedDiv.innerHTML = connected.join('');
+        statusDiv.classList.remove('hidden');
+      } else {
+        statusDiv.classList.add('hidden');
+      }
+    }
 
     async function generatePairingCode() {
       const deviceName = document.getElementById('deviceName').value;
