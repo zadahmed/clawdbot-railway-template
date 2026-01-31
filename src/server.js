@@ -427,19 +427,38 @@ app.get('/setup', requireAuth, (req, res) => {
 // Get current status
 app.get('/setup/status', requireAuth, (req, res) => {
   const configPath = join(STATE_DIR, 'config.json');
+  const channelsPath = join(STATE_DIR, 'channels.json');
   const hasConfig = existsSync(configPath);
+
   let config = {};
+  let channelsConfig = {};
+
   if (hasConfig) {
     try {
       config = JSON.parse(readFileSync(configPath, 'utf-8'));
     } catch (e) {}
   }
 
+  if (existsSync(channelsPath)) {
+    try {
+      channelsConfig = JSON.parse(readFileSync(channelsPath, 'utf-8'));
+    } catch (e) {}
+  }
+
+  // Build channels status
+  const channels = {
+    telegram: channelsConfig.telegram?.enabled || false,
+    discord: channelsConfig.discord?.enabled || false,
+    slack: channelsConfig.slack?.enabled || false
+  };
+
   res.json({
     gateway: gatewayReady ? 'running' : 'stopped',
-    configured: hasConfig,
+    configured: config.configured || false,
+    configuredAt: config.configuredAt || null,
     provider: config.provider || null,
-    hasChannels: !!(config.channels && Object.keys(config.channels).length > 0),
+    channels: channels,
+    hasChannels: channels.telegram || channels.discord || channels.slack,
     stateDir: STATE_DIR,
     csrfToken: req.session.csrfToken,
     sessionId: req.sessionId
@@ -466,36 +485,89 @@ app.post('/setup/onboard', requireAuth, validateCSRF, async (req, res) => {
       });
     }
 
-    // Write config
-    const configPath = join(STATE_DIR, 'config.json');
-    const config = existsSync(configPath) ? JSON.parse(readFileSync(configPath, 'utf-8')) : {};
+    // Create OpenClaw directory structure
+    const agentDir = join(STATE_DIR, 'agents', 'default', 'agent');
+    mkdirSync(agentDir, { recursive: true, mode: 0o700 });
 
-    config.provider = provider;
-    config[`${provider}_api_key`] = apiKey;
+    // Map provider to OpenClaw format
+    const providerMap = {
+      anthropic: { provider: 'anthropic', envVar: 'ANTHROPIC_API_KEY' },
+      openai: { provider: 'openai', envVar: 'OPENAI_API_KEY' },
+      google: { provider: 'google', envVar: 'GOOGLE_API_KEY' },
+      minimax: { provider: 'minimax', envVar: 'MINIMAX_API_KEY' }
+    };
 
-    if (channels) {
-      config.channels = {};
-      if (channels.telegram) config.channels.telegram = sanitizeInput(channels.telegram);
-      if (channels.discord) config.channels.discord = sanitizeInput(channels.discord);
-      if (channels.slack) config.channels.slack = sanitizeInput(channels.slack);
+    const providerConfig = providerMap[provider];
+
+    // Write auth-profiles.json (OpenClaw's auth config)
+    const authProfilesPath = join(agentDir, 'auth-profiles.json');
+    const authProfiles = {
+      default: {
+        provider: providerConfig.provider,
+        apiKey: apiKey
+      }
+    };
+    writeFileSync(authProfilesPath, JSON.stringify(authProfiles, null, 2), { mode: 0o600 });
+    addLog(`Auth profile saved for ${provider}`);
+
+    // Write settings.json
+    const settingsPath = join(STATE_DIR, 'settings.json');
+    const settings = existsSync(settingsPath) ? JSON.parse(readFileSync(settingsPath, 'utf-8')) : {};
+    settings.defaultProvider = providerConfig.provider;
+    settings.gateway = settings.gateway || {};
+    settings.gateway.auth = settings.gateway.auth || {};
+    settings.gateway.auth.token = gatewayToken;
+    writeFileSync(settingsPath, JSON.stringify(settings, null, 2), { mode: 0o600 });
+
+    // Configure channels if provided
+    if (channels && (channels.telegram || channels.discord || channels.slack)) {
+      const channelsPath = join(STATE_DIR, 'channels.json');
+      const channelsConfig = existsSync(channelsPath) ? JSON.parse(readFileSync(channelsPath, 'utf-8')) : {};
+
+      if (channels.telegram) {
+        channelsConfig.telegram = {
+          enabled: true,
+          token: channels.telegram
+        };
+        addLog('Telegram channel configured');
+      }
+
+      if (channels.discord) {
+        channelsConfig.discord = {
+          enabled: true,
+          token: channels.discord
+        };
+        addLog('Discord channel configured');
+      }
+
+      if (channels.slack) {
+        channelsConfig.slack = {
+          enabled: true,
+          token: channels.slack
+        };
+        addLog('Slack channel configured');
+      }
+
+      writeFileSync(channelsPath, JSON.stringify(channelsConfig, null, 2), { mode: 0o600 });
     }
 
+    // Write our own config for reference
+    const configPath = join(STATE_DIR, 'config.json');
+    const config = {
+      provider: provider,
+      configured: true,
+      configuredAt: new Date().toISOString(),
+      hasChannels: !!(channels && (channels.telegram || channels.discord || channels.slack))
+    };
     writeFileSync(configPath, JSON.stringify(config, null, 2), { mode: 0o600 });
 
     console.log('[wrapper] Configuration saved');
-    addLog('Configuration saved');
+    addLog('Configuration saved successfully');
 
-    // Run onboard
-    console.log('[wrapper] Running onboard...');
-    addLog('Running onboard...');
+    // Set environment variable for the gateway
+    process.env[providerConfig.envVar] = apiKey;
 
-    const result = execSync('openclaw onboard --non-interactive', {
-      env: { ...process.env, OPENCLAW_STATE_DIR: STATE_DIR, OPENCLAW_WORKSPACE_DIR: WORKSPACE_DIR },
-      encoding: 'utf-8',
-      timeout: 60000,
-    });
-
-    addLog(`Onboard result: ${result}`);
+    // Start gateway
     await startGateway();
 
     res.json({
@@ -1375,18 +1447,35 @@ function getSetupHTML(csrfToken, sessionId) {
         const badgeEl = document.getElementById('statusBadge');
         const descEl = document.getElementById('statusDescription');
 
+        // Build channel status text
+        const connectedChannels = [];
+        if (data.channels?.telegram) connectedChannels.push('Telegram');
+        if (data.channels?.discord) connectedChannels.push('Discord');
+        if (data.channels?.slack) connectedChannels.push('Slack');
+        const channelText = connectedChannels.length > 0 ? ' · ' + connectedChannels.join(', ') : '';
+
+        // Provider display name
+        const providerNames = { anthropic: 'Claude', openai: 'GPT', google: 'Gemini', minimax: 'MiniMax' };
+        const providerName = data.provider ? providerNames[data.provider] || data.provider : '';
+
         if (data.gateway === 'running') {
           dotEl.className = 'w-2 h-2 rounded-full bg-emerald-400 status-dot';
           statusEl.textContent = 'Running';
           statusEl.className = 'text-sm font-medium text-emerald-400';
           badgeEl.className = 'flex items-center gap-2 px-4 py-2 rounded-full bg-emerald-500/10 border border-emerald-500/30';
-          descEl.textContent = 'Your AI assistant is online and ready to help!';
+          descEl.innerHTML = 'Connected to <strong>' + providerName + '</strong>' + channelText + ' · Ready to help!';
+        } else if (data.configured) {
+          dotEl.className = 'w-2 h-2 rounded-full bg-amber-400';
+          statusEl.textContent = 'Stopped';
+          statusEl.className = 'text-sm font-medium text-amber-400';
+          badgeEl.className = 'flex items-center gap-2 px-4 py-2 rounded-full bg-amber-500/10 border border-amber-500/30';
+          descEl.innerHTML = 'Configured with <strong>' + providerName + '</strong>' + channelText + ' · Click Start to run';
         } else {
           dotEl.className = 'w-2 h-2 rounded-full bg-slate-500';
-          statusEl.textContent = data.configured ? 'Stopped' : 'Not Set Up';
+          statusEl.textContent = 'Not Set Up';
           statusEl.className = 'text-sm font-medium text-slate-400';
           badgeEl.className = 'flex items-center gap-2 px-4 py-2 rounded-full bg-slate-800/50 border border-slate-700/50';
-          descEl.textContent = data.configured ? 'Your AI is configured but not running. Click Start to wake it up.' : 'Complete the setup below to get started.';
+          descEl.textContent = 'Complete the setup below to get started';
         }
 
         updateSteps(data.configured, data.gateway === 'running');
