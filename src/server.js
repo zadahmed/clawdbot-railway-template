@@ -105,63 +105,24 @@ async function startGateway() {
   console.log('[wrapper] Starting OpenClaw gateway...');
   addLog('Starting gateway...');
 
-  // Load API key from config if available
-  const configPath = join(STATE_DIR, 'config.json');
-  const authProfilesPath = join(STATE_DIR, 'agents', 'default', 'agent', 'auth-profiles.json');
-  let apiKey = '';
-  let provider = '';
-
-  if (existsSync(configPath)) {
-    try {
-      const config = JSON.parse(readFileSync(configPath, 'utf-8'));
-      provider = config.provider || '';
-    } catch (e) {}
-  }
-
-  if (existsSync(authProfilesPath)) {
-    try {
-      const authProfiles = JSON.parse(readFileSync(authProfilesPath, 'utf-8'));
-      apiKey = authProfiles.default?.apiKey || '';
-    } catch (e) {}
-  }
-
-  // Set the appropriate API key environment variable
-  const envVarMap = {
-    anthropic: 'ANTHROPIC_API_KEY',
-    openai: 'OPENAI_API_KEY',
-    google: 'GOOGLE_API_KEY',
-    minimax: 'MINIMAX_API_KEY'
-  };
-
-  // Map provider to model string
-  const modelMap = {
-    anthropic: 'anthropic/claude-sonnet-4-20250514',
-    openai: 'openai/gpt-4o',
-    google: 'google/gemini-2.0-flash',
-    minimax: 'minimax/MiniMax-Text-01'
-  };
-
   const env = {
     ...process.env,
     OPENCLAW_STATE_DIR: STATE_DIR,
     OPENCLAW_WORKSPACE_DIR: WORKSPACE_DIR,
-    OPENCLAW_GATEWAY_PORT: String(GATEWAY_PORT),
-    OPENCLAW_GATEWAY_HOST: GATEWAY_HOST,
-    OPENCLAW_GATEWAY_TOKEN: gatewayToken,
     OPENCLAW_NON_INTERACTIVE: '1',
   };
 
-  // Add the API key and model to environment
-  if (provider && apiKey && envVarMap[provider]) {
-    env[envVarMap[provider]] = apiKey;
-  }
+  // Gateway arguments matching reference implementation
+  const gatewayArgs = [
+    'gateway',
+    'run',
+    '--bind', 'loopback',
+    '--port', String(GATEWAY_PORT),
+    '--auth', 'token',
+    '--token', gatewayToken
+  ];
 
-  // Set the model
-  if (provider && modelMap[provider]) {
-    env.OPENCLAW_MODEL = modelMap[provider];
-  }
-
-  gatewayProcess = spawn('openclaw', ['gateway', '--allow-unconfigured'], {
+  gatewayProcess = spawn('openclaw', gatewayArgs, {
     env,
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -521,53 +482,83 @@ app.post('/setup/onboard', requireAuth, validateCSRF, async (req, res) => {
     const { provider, apiKey, channels } = req.body;
 
     // Validate inputs
-    if (!provider || !['anthropic', 'openai', 'google', 'minimax'].includes(provider)) {
+    if (!provider || !['anthropic', 'openai', 'google', 'openrouter', 'minimax', 'groq', 'xai'].includes(provider)) {
       return res.status(400).json({
         error: 'Invalid provider',
-        message: 'Please select a valid AI provider (Anthropic, OpenAI, Google, or MiniMax).'
+        message: 'Please select a valid AI provider.'
       });
     }
 
     if (!apiKey || !isValidAPIKey(apiKey)) {
       return res.status(400).json({
         error: 'Invalid API key',
-        message: 'Please enter a valid API key. It should start with the correct prefix for your provider.'
+        message: 'Please enter a valid API key.'
       });
     }
 
-    // Create OpenClaw directory structure
-    const agentDir = join(STATE_DIR, 'agents', 'default', 'agent');
-    mkdirSync(agentDir, { recursive: true, mode: 0o700 });
-
-    // Map provider to OpenClaw format
-    const providerMap = {
-      anthropic: { provider: 'anthropic', envVar: 'ANTHROPIC_API_KEY' },
-      openai: { provider: 'openai', envVar: 'OPENAI_API_KEY' },
-      google: { provider: 'google', envVar: 'GOOGLE_API_KEY' },
-      minimax: { provider: 'minimax', envVar: 'MINIMAX_API_KEY' }
+    // Map provider to auth choice and API key flag
+    const providerConfig = {
+      anthropic: { authChoice: 'apiKey', flag: '--anthropic-api-key' },
+      openai: { authChoice: 'openai-api-key', flag: '--openai-api-key' },
+      google: { authChoice: 'google-api-key', flag: '--google-api-key' },
+      openrouter: { authChoice: 'openrouter-api-key', flag: '--openrouter-api-key' },
+      minimax: { authChoice: 'minimax-api-key', flag: '--minimax-api-key' },
+      groq: { authChoice: 'groq-api-key', flag: '--groq-api-key' },
+      xai: { authChoice: 'xai-api-key', flag: '--xai-api-key' }
     };
 
-    const providerConfig = providerMap[provider];
+    const config = providerConfig[provider];
+    addLog(`Starting onboard for ${provider}...`);
 
-    // Write auth-profiles.json (OpenClaw's auth config)
-    const authProfilesPath = join(agentDir, 'auth-profiles.json');
-    const authProfiles = {
-      default: {
-        provider: providerConfig.provider,
-        apiKey: apiKey
-      }
+    // Build onboard command arguments
+    const onboardArgs = [
+      'onboard',
+      '--non-interactive',
+      '--accept-risk',
+      '--json',
+      '--flow', 'quickstart',
+      '--auth-choice', config.authChoice,
+      config.flag, apiKey
+    ];
+
+    // Run openclaw onboard
+    const onboardEnv = {
+      ...process.env,
+      OPENCLAW_STATE_DIR: STATE_DIR,
+      OPENCLAW_WORKSPACE_DIR: WORKSPACE_DIR,
+      OPENCLAW_NON_INTERACTIVE: '1'
     };
-    writeFileSync(authProfilesPath, JSON.stringify(authProfiles, null, 2), { mode: 0o600 });
-    addLog(`Auth profile saved for ${provider}`);
 
-    // Write settings.json
-    const settingsPath = join(STATE_DIR, 'settings.json');
-    const settings = existsSync(settingsPath) ? JSON.parse(readFileSync(settingsPath, 'utf-8')) : {};
-    settings.defaultProvider = providerConfig.provider;
-    settings.gateway = settings.gateway || {};
-    settings.gateway.auth = settings.gateway.auth || {};
-    settings.gateway.auth.token = gatewayToken;
-    writeFileSync(settingsPath, JSON.stringify(settings, null, 2), { mode: 0o600 });
+    try {
+      const result = execSync(`openclaw ${onboardArgs.join(' ')}`, {
+        env: onboardEnv,
+        encoding: 'utf-8',
+        timeout: 120000,
+        stdio: ['pipe', 'pipe', 'pipe']
+      });
+      addLog('Onboard completed successfully');
+      addLog(result.substring(0, 200));
+    } catch (onboardErr) {
+      addLog(`Onboard warning: ${onboardErr.message}`);
+      // Continue even if onboard fails - we'll set config manually
+    }
+
+    // Configure gateway auth token
+    try {
+      execSync(`openclaw config set gateway.auth.mode token`, {
+        env: onboardEnv,
+        encoding: 'utf-8',
+        timeout: 10000
+      });
+      execSync(`openclaw config set gateway.auth.token ${gatewayToken}`, {
+        env: onboardEnv,
+        encoding: 'utf-8',
+        timeout: 10000
+      });
+      addLog('Gateway auth configured');
+    } catch (configErr) {
+      addLog(`Config warning: ${configErr.message}`);
+    }
 
     // Configure channels if provided
     if (channels && (channels.telegram || channels.discord || channels.slack)) {
@@ -575,25 +566,26 @@ app.post('/setup/onboard', requireAuth, validateCSRF, async (req, res) => {
       const channelsConfig = existsSync(channelsPath) ? JSON.parse(readFileSync(channelsPath, 'utf-8')) : {};
 
       if (channels.telegram) {
-        channelsConfig.telegram = {
-          enabled: true,
-          token: channels.telegram
-        };
+        channelsConfig.telegram = { enabled: true, token: channels.telegram };
+        // Also configure via CLI
+        try {
+          const telegramConfig = JSON.stringify({ enabled: true, token: channels.telegram });
+          execSync(`openclaw config set channels.telegram '${telegramConfig}'`, {
+            env: onboardEnv,
+            encoding: 'utf-8',
+            timeout: 10000
+          });
+        } catch (e) {}
         addLog('Telegram channel configured');
       }
 
       if (channels.discord) {
-        channelsConfig.discord = {
-          enabled: true,
-          token: channels.discord
-        };
+        channelsConfig.discord = { enabled: true, token: channels.discord };
         addLog('Discord channel configured');
       }
 
       if (channels.slack) {
-        channelsConfig.slack = {
-          enabled: true,
-          token: channels.slack
+        channelsConfig.slack = { enabled: true, token: channels.slack
         };
         addLog('Slack channel configured');
       }
@@ -602,20 +594,17 @@ app.post('/setup/onboard', requireAuth, validateCSRF, async (req, res) => {
     }
 
     // Write our own config for reference
-    const configPath = join(STATE_DIR, 'config.json');
-    const config = {
+    const ourConfigPath = join(STATE_DIR, 'config.json');
+    const ourConfig = {
       provider: provider,
       configured: true,
       configuredAt: new Date().toISOString(),
       hasChannels: !!(channels && (channels.telegram || channels.discord || channels.slack))
     };
-    writeFileSync(configPath, JSON.stringify(config, null, 2), { mode: 0o600 });
+    writeFileSync(ourConfigPath, JSON.stringify(ourConfig, null, 2), { mode: 0o600 });
 
     console.log('[wrapper] Configuration saved');
     addLog('Configuration saved successfully');
-
-    // Set environment variable for the gateway
-    process.env[providerConfig.envVar] = apiKey;
 
     // Start gateway
     await startGateway();
@@ -1316,7 +1305,10 @@ function getSetupHTML(csrfToken, sessionId) {
                 <option value="anthropic">Claude by Anthropic (Recommended)</option>
                 <option value="openai">GPT by OpenAI</option>
                 <option value="google">Gemini by Google</option>
+                <option value="openrouter">OpenRouter (Multiple Models)</option>
                 <option value="minimax">MiniMax (Budget-Friendly)</option>
+                <option value="groq">Groq (Fast Inference)</option>
+                <option value="xai">xAI Grok</option>
               </select>
               <div class="absolute right-4 top-1/2 -translate-y-1/2 pointer-events-none">
                 <svg class="w-5 h-5 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/></svg>
@@ -1325,22 +1317,13 @@ function getSetupHTML(csrfToken, sessionId) {
             <div id="apiKeyLinks" class="mt-3 p-3 rounded-lg bg-slate-800/30 border border-slate-700/30">
               <p class="text-xs text-slate-400 mb-2">Get your API key:</p>
               <div class="flex flex-wrap gap-2">
-                <a href="https://console.anthropic.com/settings/keys" target="_blank" class="inline-flex items-center gap-1 px-2 py-1 rounded text-xs bg-violet-500/10 text-violet-400 hover:bg-violet-500/20 transition-colors">
-                  <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"/></svg>
-                  Anthropic
-                </a>
-                <a href="https://platform.openai.com/api-keys" target="_blank" class="inline-flex items-center gap-1 px-2 py-1 rounded text-xs bg-emerald-500/10 text-emerald-400 hover:bg-emerald-500/20 transition-colors">
-                  <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"/></svg>
-                  OpenAI
-                </a>
-                <a href="https://aistudio.google.com/apikey" target="_blank" class="inline-flex items-center gap-1 px-2 py-1 rounded text-xs bg-blue-500/10 text-blue-400 hover:bg-blue-500/20 transition-colors">
-                  <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"/></svg>
-                  Google
-                </a>
-                <a href="https://platform.minimax.io/subscribe/coding-plan?code=AlUL2IhlbC&source=link" target="_blank" class="inline-flex items-center gap-1 px-2 py-1 rounded text-xs bg-orange-500/10 text-orange-400 hover:bg-orange-500/20 transition-colors">
-                  <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"/></svg>
-                  MiniMax (10% OFF)
-                </a>
+                <a href="https://console.anthropic.com/settings/keys" target="_blank" class="inline-flex items-center gap-1 px-2 py-1 rounded text-xs bg-violet-500/10 text-violet-400 hover:bg-violet-500/20 transition-colors">Anthropic</a>
+                <a href="https://platform.openai.com/api-keys" target="_blank" class="inline-flex items-center gap-1 px-2 py-1 rounded text-xs bg-emerald-500/10 text-emerald-400 hover:bg-emerald-500/20 transition-colors">OpenAI</a>
+                <a href="https://aistudio.google.com/apikey" target="_blank" class="inline-flex items-center gap-1 px-2 py-1 rounded text-xs bg-blue-500/10 text-blue-400 hover:bg-blue-500/20 transition-colors">Google</a>
+                <a href="https://openrouter.ai/keys" target="_blank" class="inline-flex items-center gap-1 px-2 py-1 rounded text-xs bg-pink-500/10 text-pink-400 hover:bg-pink-500/20 transition-colors">OpenRouter</a>
+                <a href="https://platform.minimax.io/subscribe/coding-plan?code=AlUL2IhlbC&source=link" target="_blank" class="inline-flex items-center gap-1 px-2 py-1 rounded text-xs bg-orange-500/10 text-orange-400 hover:bg-orange-500/20 transition-colors">MiniMax (10% OFF)</a>
+                <a href="https://console.groq.com/keys" target="_blank" class="inline-flex items-center gap-1 px-2 py-1 rounded text-xs bg-cyan-500/10 text-cyan-400 hover:bg-cyan-500/20 transition-colors">Groq</a>
+                <a href="https://console.x.ai" target="_blank" class="inline-flex items-center gap-1 px-2 py-1 rounded text-xs bg-slate-500/10 text-slate-400 hover:bg-slate-500/20 transition-colors">xAI</a>
               </div>
             </div>
           </div>
