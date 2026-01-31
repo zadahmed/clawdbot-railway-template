@@ -25,7 +25,7 @@ import { join } from 'path';
 import { randomBytes, createHash, timingSafeEqual } from 'crypto';
 import { homedir } from 'os';
 import { pipeline } from 'stream/promises';
-import tar from 'tar';
+import * as tar from 'tar';
 
 // ============================================================================
 // CONFIGURATION
@@ -283,7 +283,7 @@ app.use('/setup', (req, res, next) => {
   next();
 });
 
-// Session and CSRF middleware for protected routes
+// Session validation middleware for protected routes
 function requireAuth(req, res, next) {
   if (!SETUP_PASSWORD) {
     return res.status(500).json({
@@ -292,7 +292,7 @@ function requireAuth(req, res, next) {
     });
   }
 
-  const sessionId = req.headers['x-session-id'] || req.cookies?.session;
+  const sessionId = req.headers['x-session-id'];
   const ip = getClientIP(req);
 
   if (sessionId) {
@@ -304,46 +304,17 @@ function requireAuth(req, res, next) {
     }
   }
 
-  // Fall back to basic auth
-  const authHeader = req.headers.authorization;
-  if (!authHeader || !authHeader.startsWith('Basic ')) {
-    res.setHeader('WWW-Authenticate', 'Basic realm="OpenClaw Setup"');
-    return res.status(401).json({
-      error: 'Authentication required',
-      message: 'Please enter your setup password to continue.'
-    });
+  // No valid session - redirect to login for HTML requests, return 401 for API
+  const acceptsHtml = req.headers.accept?.includes('text/html');
+  if (acceptsHtml && req.method === 'GET') {
+    return res.redirect('/setup/login');
   }
 
-  const credentials = Buffer.from(authHeader.slice(6), 'base64').toString();
-  const [, password] = credentials.split(':');
-
-  // Timing-safe comparison
-  const passwordBuffer = Buffer.from(password || '');
-  const setupPasswordBuffer = Buffer.from(SETUP_PASSWORD);
-
-  if (passwordBuffer.length !== setupPasswordBuffer.length ||
-      !timingSafeEqual(passwordBuffer, setupPasswordBuffer)) {
-    recordLoginAttempt(ip, false);
-    res.setHeader('WWW-Authenticate', 'Basic realm="OpenClaw Setup"');
-    return res.status(401).json({
-      error: 'Invalid password',
-      message: 'The password you entered is incorrect. Please try again.'
-    });
-  }
-
-  recordLoginAttempt(ip, true);
-
-  // Create session
-  const newSessionId = generateSessionId();
-  const csrfToken = generateCSRFToken();
-  sessions.set(newSessionId, { ip, createdAt: Date.now(), csrfToken });
-  req.session = sessions.get(newSessionId);
-  req.sessionId = newSessionId;
-
-  res.setHeader('X-Session-Id', newSessionId);
-  res.setHeader('X-CSRF-Token', csrfToken);
-
-  next();
+  return res.status(401).json({
+    error: 'Authentication required',
+    message: 'Please log in to continue.',
+    redirect: '/setup/login'
+  });
 }
 
 // CSRF validation for state-changing operations
@@ -373,6 +344,76 @@ app.get('/setup/healthz', (req, res) => {
     gateway: gatewayReady ? 'running' : 'stopped',
     timestamp: new Date().toISOString(),
     secure: !!SETUP_PASSWORD
+  });
+});
+
+// Login page (no auth required)
+app.get('/setup/login', (req, res) => {
+  // If already logged in, redirect to setup
+  const sessionId = req.headers['x-session-id'] || req.query.session;
+  if (sessionId && validateSession(sessionId, getClientIP(req))) {
+    return res.redirect('/setup');
+  }
+  res.setHeader('Content-Type', 'text/html');
+  res.send(getLoginHTML());
+});
+
+// Login POST endpoint
+app.post('/setup/login', (req, res) => {
+  const ip = getClientIP(req);
+
+  if (isRateLimited(ip)) {
+    const record = loginAttempts.get(ip);
+    const remainingMs = record.lockedUntil - Date.now();
+    const remainingMins = Math.ceil(remainingMs / 60000);
+    return res.status(429).json({
+      error: 'Too many attempts',
+      message: `Too many failed attempts. Please try again in ${remainingMins} minute${remainingMins > 1 ? 's' : ''}.`
+    });
+  }
+
+  const { password } = req.body;
+
+  if (!password) {
+    return res.status(400).json({
+      error: 'Password required',
+      message: 'Please enter your setup password.'
+    });
+  }
+
+  // Timing-safe comparison
+  const passwordBuffer = Buffer.from(String(password));
+  const setupPasswordBuffer = Buffer.from(SETUP_PASSWORD);
+
+  let isValid = false;
+  if (passwordBuffer.length === setupPasswordBuffer.length) {
+    isValid = timingSafeEqual(passwordBuffer, setupPasswordBuffer);
+  }
+
+  if (!isValid) {
+    recordLoginAttempt(ip, false);
+    const record = loginAttempts.get(ip);
+    const attemptsLeft = MAX_LOGIN_ATTEMPTS - (record?.count || 0);
+    return res.status(401).json({
+      error: 'Invalid password',
+      message: attemptsLeft > 0
+        ? `Incorrect password. ${attemptsLeft} attempt${attemptsLeft > 1 ? 's' : ''} remaining.`
+        : 'Too many failed attempts. Please try again later.'
+    });
+  }
+
+  recordLoginAttempt(ip, true);
+
+  // Create session
+  const sessionId = generateSessionId();
+  const csrfToken = generateCSRFToken();
+  sessions.set(sessionId, { ip, createdAt: Date.now(), csrfToken });
+
+  res.json({
+    success: true,
+    message: 'Welcome! Redirecting to setup...',
+    sessionId,
+    csrfToken
   });
 });
 
@@ -729,6 +770,155 @@ server.on('upgrade', (req, socket, head) => {
 });
 
 // ============================================================================
+// LOGIN HTML PAGE
+// ============================================================================
+
+function getLoginHTML() {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>OpenClaw - Login</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <script>
+    tailwind.config = {
+      theme: { extend: { fontFamily: { sans: ['Inter', 'system-ui', 'sans-serif'] } } }
+    }
+  </script>
+  <style>
+    .glass { background: rgba(15, 23, 42, 0.7); backdrop-filter: blur(20px); border: 1px solid rgba(255, 255, 255, 0.1); }
+    .gradient-text { background: linear-gradient(135deg, #a78bfa 0%, #f472b6 50%, #fb923c 100%); -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text; }
+    .btn-gradient { background: linear-gradient(135deg, #8b5cf6 0%, #d946ef 50%, #f97316 100%); background-size: 200% 200%; }
+    .btn-gradient:hover { background-position: 100% 50%; }
+    .input-glow:focus { box-shadow: 0 0 0 3px rgba(139, 92, 246, 0.3), 0 0 30px rgba(139, 92, 246, 0.15); }
+    @keyframes float { 0%, 100% { transform: translateY(0px); } 50% { transform: translateY(-10px); } }
+    @keyframes glow { 0% { box-shadow: 0 0 30px rgba(139, 92, 246, 0.4); } 100% { box-shadow: 0 0 50px rgba(139, 92, 246, 0.7); } }
+    .animate-float { animation: float 6s ease-in-out infinite; }
+    .animate-glow { animation: glow 2s ease-in-out infinite alternate; }
+  </style>
+</head>
+<body class="min-h-screen bg-slate-950 text-slate-100 font-sans antialiased flex items-center justify-center p-4">
+  <!-- Background -->
+  <div class="fixed inset-0 -z-10">
+    <div class="absolute inset-0 bg-gradient-to-br from-slate-950 via-purple-950/20 to-slate-950"></div>
+    <div class="absolute top-1/4 left-1/4 w-96 h-96 bg-purple-500/10 rounded-full blur-3xl"></div>
+    <div class="absolute bottom-1/4 right-1/4 w-96 h-96 bg-pink-500/10 rounded-full blur-3xl"></div>
+  </div>
+
+  <div class="w-full max-w-md">
+    <!-- Logo -->
+    <div class="text-center mb-8 animate-float">
+      <div class="inline-flex items-center justify-center w-20 h-20 rounded-2xl bg-gradient-to-br from-violet-500 to-pink-500 mb-6 shadow-2xl animate-glow">
+        <span class="text-4xl">🦞</span>
+      </div>
+      <h1 class="text-3xl font-bold gradient-text mb-2">OpenClaw</h1>
+      <p class="text-slate-400">Enter your password to access the setup wizard</p>
+    </div>
+
+    <!-- Login Card -->
+    <div class="glass rounded-2xl p-8">
+      <form id="loginForm" class="space-y-6">
+        <div>
+          <label for="password" class="block text-sm font-medium text-slate-300 mb-2">Setup Password</label>
+          <div class="relative">
+            <input type="password" id="password" name="password" required autofocus
+              placeholder="Enter your password"
+              class="w-full px-4 py-4 rounded-xl bg-slate-800/50 border border-slate-700/50 text-white placeholder-slate-500 transition-all duration-200 focus:outline-none focus:border-violet-500/50 input-glow text-lg">
+            <button type="button" onclick="togglePassword()" class="absolute right-4 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-300 transition-colors">
+              <svg id="eyeIcon" class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/>
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"/>
+              </svg>
+            </button>
+          </div>
+        </div>
+
+        <div id="error" class="hidden p-4 rounded-xl bg-red-500/10 border border-red-500/30 text-red-400 text-sm"></div>
+
+        <button type="submit" id="submitBtn" class="w-full py-4 rounded-xl btn-gradient text-white font-semibold text-lg transition-all duration-300 shadow-lg shadow-violet-500/20 hover:shadow-violet-500/40 hover:scale-[1.02] active:scale-[0.98] disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:scale-100">
+          <span class="flex items-center justify-center gap-2">
+            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 16l-4-4m0 0l4-4m-4 4h14m-5 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h7a3 3 0 013 3v1"/>
+            </svg>
+            Unlock Setup
+          </span>
+        </button>
+      </form>
+
+      <p class="text-center text-xs text-slate-500 mt-6">
+        This is the password you set in your SETUP_PASSWORD environment variable
+      </p>
+    </div>
+
+    <!-- Footer -->
+    <p class="text-center text-sm text-slate-600 mt-6">
+      Powered by <a href="https://openclaw.ai" target="_blank" class="text-violet-400 hover:text-violet-300">OpenClaw</a>
+    </p>
+  </div>
+
+  <script>
+    function togglePassword() {
+      const input = document.getElementById('password');
+      input.type = input.type === 'password' ? 'text' : 'password';
+    }
+
+    document.getElementById('loginForm').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const btn = document.getElementById('submitBtn');
+      const errorEl = document.getElementById('error');
+      const password = document.getElementById('password').value;
+
+      btn.disabled = true;
+      btn.innerHTML = '<span class="flex items-center justify-center gap-2"><svg class="w-5 h-5 animate-spin" fill="none" stroke="currentColor" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>Checking...</span>';
+      errorEl.classList.add('hidden');
+
+      try {
+        const res = await fetch('/setup/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ password })
+        });
+
+        const data = await res.json();
+
+        if (data.success) {
+          // Store session in localStorage
+          localStorage.setItem('openclaw_session', data.sessionId);
+          localStorage.setItem('openclaw_csrf', data.csrfToken);
+          window.location.href = '/setup';
+        } else {
+          errorEl.textContent = data.message || 'Invalid password';
+          errorEl.classList.remove('hidden');
+          btn.disabled = false;
+          btn.innerHTML = '<span class="flex items-center justify-center gap-2"><svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 16l-4-4m0 0l4-4m-4 4h14m-5 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h7a3 3 0 013 3v1"/></svg>Unlock Setup</span>';
+        }
+      } catch (err) {
+        errorEl.textContent = 'Connection error. Please try again.';
+        errorEl.classList.remove('hidden');
+        btn.disabled = false;
+        btn.innerHTML = '<span class="flex items-center justify-center gap-2"><svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 16l-4-4m0 0l4-4m-4 4h14m-5 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h7a3 3 0 013 3v1"/></svg>Unlock Setup</span>';
+      }
+    });
+
+    // Check if already logged in
+    const session = localStorage.getItem('openclaw_session');
+    if (session) {
+      fetch('/setup/status', {
+        headers: { 'X-Session-Id': session }
+      }).then(res => {
+        if (res.ok) window.location.href = '/setup';
+      }).catch(() => {});
+    }
+  </script>
+</body>
+</html>`;
+}
+
+// ============================================================================
 // SETUP HTML PAGE
 // ============================================================================
 
@@ -783,8 +973,15 @@ function getSetupHTML(csrfToken, sessionId) {
 <body class="min-h-screen bg-slate-950 text-slate-100 font-sans antialiased overflow-x-hidden">
   <!-- Security tokens -->
   <script>
-    window.CSRF_TOKEN = '${csrfToken}';
-    window.SESSION_ID = '${sessionId}';
+    // Initialize from server or localStorage
+    window.CSRF_TOKEN = '${csrfToken}' || localStorage.getItem('openclaw_csrf') || '';
+    window.SESSION_ID = '${sessionId}' || localStorage.getItem('openclaw_session') || '';
+
+    // Store in localStorage for persistence
+    if ('${sessionId}') {
+      localStorage.setItem('openclaw_session', '${sessionId}');
+      localStorage.setItem('openclaw_csrf', '${csrfToken}');
+    }
   </script>
 
   <!-- Animated Background -->
@@ -1103,7 +1300,7 @@ function getSetupHTML(csrfToken, sessionId) {
       <div class="mt-8 text-center space-y-2">
         <p class="text-sm text-slate-500">
           Powered by <a href="https://openclaw.ai" target="_blank" class="text-violet-400 hover:text-violet-300 transition-colors">OpenClaw</a> ·
-          Deployed on <a href="https://railway.app" target="_blank" class="text-violet-400 hover:text-violet-300 transition-colors">Railway</a>
+          Deployed on <a href="https://railway.com/?referralCode=kXOukk" target="_blank" class="text-violet-400 hover:text-violet-300 transition-colors">Railway</a>
         </p>
         <button onclick="logout()" class="text-xs text-slate-600 hover:text-slate-400 transition-colors">Sign out</button>
       </div>
@@ -1113,13 +1310,28 @@ function getSetupHTML(csrfToken, sessionId) {
   <script>
     // Secure fetch wrapper
     async function secureFetch(url, options = {}) {
+      // Always get latest from localStorage as fallback
+      const sessionId = window.SESSION_ID || localStorage.getItem('openclaw_session') || '';
+      const csrfToken = window.CSRF_TOKEN || localStorage.getItem('openclaw_csrf') || '';
+
       const headers = {
         'Content-Type': 'application/json',
-        'X-CSRF-Token': window.CSRF_TOKEN,
-        'X-Session-Id': window.SESSION_ID,
+        'X-CSRF-Token': csrfToken,
+        'X-Session-Id': sessionId,
         ...options.headers
       };
-      return fetch(url, { ...options, headers });
+
+      const res = await fetch(url, { ...options, headers });
+
+      // Handle auth errors
+      if (res.status === 401) {
+        localStorage.removeItem('openclaw_session');
+        localStorage.removeItem('openclaw_csrf');
+        window.location.href = '/setup/login';
+        throw new Error('Session expired');
+      }
+
+      return res;
     }
 
     function togglePassword(id) {
@@ -1173,7 +1385,14 @@ function getSetupHTML(csrfToken, sessionId) {
         updateSteps(data.configured, data.gateway === 'running');
 
         // Update CSRF token if provided
-        if (data.csrfToken) window.CSRF_TOKEN = data.csrfToken;
+        if (data.csrfToken) {
+          window.CSRF_TOKEN = data.csrfToken;
+          localStorage.setItem('openclaw_csrf', data.csrfToken);
+        }
+        if (data.sessionId) {
+          window.SESSION_ID = data.sessionId;
+          localStorage.setItem('openclaw_session', data.sessionId);
+        }
       } catch (e) {
         console.error('Status check failed:', e);
       }
@@ -1353,10 +1572,22 @@ function getSetupHTML(csrfToken, sessionId) {
     async function logout() {
       try {
         await secureFetch('/setup/logout', { method: 'POST' });
-        window.location.reload();
-      } catch (e) {
-        window.location.reload();
+      } catch (e) {}
+      // Clear session from localStorage
+      localStorage.removeItem('openclaw_session');
+      localStorage.removeItem('openclaw_csrf');
+      window.location.href = '/setup/login';
+    }
+
+    // Handle 401 errors - redirect to login
+    function handleAuthError(res) {
+      if (res.status === 401) {
+        localStorage.removeItem('openclaw_session');
+        localStorage.removeItem('openclaw_csrf');
+        window.location.href = '/setup/login';
+        return true;
       }
+      return false;
     }
 
     // Initial load
