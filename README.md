@@ -1,6 +1,6 @@
 # ClawdBot Railway Template
 
-[![Deploy on Railway](https://railway.app/button.svg)](https://railway.app/template/clawdbot?referralCode=kXOukk)
+[![Deploy on Railway](https://railway.app/button.svg)](https://railway.com/deploy/hogNz1?referralCode=kXOukk&utm_medium=integration&utm_source=template&utm_campaign=generic)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Node.js Version](https://img.shields.io/badge/node-%3E%3D22-brightgreen)](https://nodejs.org/)
 
@@ -80,21 +80,55 @@ OpenClaw is an open-source personal AI assistant that can:
 ## Quick Deploy
 
 1. **Click the Deploy button** above
-2. **Set your password** - Add `SETUP_PASSWORD` environment variable
-3. **Wait for build** - Takes 3-5 minutes
+2. **Add one variable** - Set `SETUP_PASSWORD` to a strong password
+3. **Click Deploy** - Wait 3-5 minutes for build
 4. **Open your app** - Go to `https://your-app.railway.app/setup`
-5. **Enter your password** - The one you set in step 2
-6. **Add your AI provider** - Paste your API key
+5. **Log in** - Enter the password you set
+6. **Configure AI** - Select provider and paste your API key
 7. **Done!** - Your AI assistant is running
+
+> **Note:** The persistent volume (`/data`) and other settings are **automatically configured** from `railway.toml`. You only need to set `SETUP_PASSWORD`.
+
+## Railway Template Setup
+
+When creating the template in Railway:
+
+| Setting | Value |
+|---------|-------|
+| **Source** | Your GitHub repo |
+| **Branch** | `main` |
+| **Environment Variables** | Add `SETUP_PASSWORD` (required) |
+| **Volume** | Auto-configured at `/data` |
+| **Networking** | Public HTTP (auto-configured) |
+| **Health Check** | `/setup/healthz` (auto-configured) |
+
+Everything else is pre-configured in `railway.toml`:
+```toml
+[build]
+builder = "dockerfile"
+
+[deploy]
+healthcheckPath = "/setup/healthz"
+healthcheckTimeout = 300
+restartPolicyType = "on_failure"
+
+[[mounts]]
+mount = "/data"
+
+[variables]
+PORT = "8080"
+OPENCLAW_STATE_DIR = "/data/.openclaw"
+OPENCLAW_WORKSPACE_DIR = "/data/workspace"
+```
 
 ## Environment Variables
 
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `SETUP_PASSWORD` | **Yes** | Password to access the setup wizard |
-| `OPENCLAW_STATE_DIR` | No | State directory (default: `/data/.openclaw`) |
-| `OPENCLAW_WORKSPACE_DIR` | No | Workspace directory (default: `/data/workspace`) |
-| `OPENCLAW_GATEWAY_TOKEN` | No | Gateway auth token (auto-generated if not set) |
+| `OPENCLAW_STATE_DIR` | No | Auto-configured: `/data/.openclaw` |
+| `OPENCLAW_WORKSPACE_DIR` | No | Auto-configured: `/data/workspace` |
+| `OPENCLAW_GATEWAY_TOKEN` | No | Gateway auth token (auto-generated) |
 | `OPENCLAW_GIT_REF` | No | Git ref to build OpenClaw from (default: `main`) |
 
 ## Supported AI Providers
