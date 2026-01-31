@@ -135,10 +135,10 @@ OPENCLAW_WORKSPACE_DIR = "/data/workspace"
 
 | Provider | Get API Key | Notes |
 |----------|-------------|-------|
-| **Anthropic** (Claude) | [console.anthropic.com](https://console.anthropic.com/settings/keys) | Recommended, best quality |
+| **MiniMax** | [10% OFF with this link](https://platform.minimax.io/subscribe/coding-plan?code=AlUL2IhlbC&source=link) | **Recommended** – great quality, budget-friendly |
+| **Anthropic** (Claude) | [console.anthropic.com](https://console.anthropic.com/settings/keys) | Best quality |
 | **OpenAI** (GPT) | [platform.openai.com](https://platform.openai.com/api-keys) | Wide compatibility |
 | **Google** (Gemini) | [aistudio.google.com](https://aistudio.google.com/apikey) | Free tier available |
-| **MiniMax** | [10% OFF with this link](https://platform.minimax.io/subscribe/coding-plan?code=AlUL2IhlbC&source=link) | Budget-friendly option |
 
 ## Supported Chat Channels
 

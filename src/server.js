@@ -496,15 +496,15 @@ app.post('/setup/onboard', requireAuth, validateCSRF, async (req, res) => {
       });
     }
 
-    // Map provider to auth choice, API key flag, and default model id for agents.defaults
+    // Map provider to auth choice, API key flag, default model id, and env var name for .env
     const providerConfig = {
-      anthropic: { authChoice: 'apiKey', flag: '--anthropic-api-key', primaryModel: 'anthropic/claude-opus-4-5' },
-      openai: { authChoice: 'openai-api-key', flag: '--openai-api-key', primaryModel: 'openai/gpt-4o' },
-      google: { authChoice: 'google-api-key', flag: '--google-api-key', primaryModel: 'google/gemini-2.0-flash' },
-      openrouter: { authChoice: 'openrouter-api-key', flag: '--openrouter-api-key', primaryModel: 'openrouter/anthropic/claude-sonnet-4' },
-      minimax: { authChoice: 'minimax-api-key', flag: '--minimax-api-key', primaryModel: 'minimax/MiniMax-M2.1' },
-      groq: { authChoice: 'groq-api-key', flag: '--groq-api-key', primaryModel: 'groq/llama-4-scout-17b-16e-instruct' },
-      xai: { authChoice: 'xai-api-key', flag: '--xai-api-key', primaryModel: 'xai/grok-3-mini' }
+      anthropic: { authChoice: 'apiKey', flag: '--anthropic-api-key', primaryModel: 'anthropic/claude-opus-4-5', envVar: 'ANTHROPIC_API_KEY' },
+      openai: { authChoice: 'openai-api-key', flag: '--openai-api-key', primaryModel: 'openai/gpt-4o', envVar: 'OPENAI_API_KEY' },
+      google: { authChoice: 'google-api-key', flag: '--google-api-key', primaryModel: 'google/gemini-2.0-flash', envVar: 'GOOGLE_API_KEY' },
+      openrouter: { authChoice: 'openrouter-api-key', flag: '--openrouter-api-key', primaryModel: 'openrouter/anthropic/claude-sonnet-4', envVar: 'OPENROUTER_API_KEY' },
+      minimax: { authChoice: 'minimax-api-key', flag: '--minimax-api-key', primaryModel: 'minimax/MiniMax-M2.1', envVar: 'MINIMAX_API_KEY' },
+      groq: { authChoice: 'groq-api-key', flag: '--groq-api-key', primaryModel: 'groq/llama-4-scout-17b-16e-instruct', envVar: 'GROQ_API_KEY' },
+      xai: { authChoice: 'xai-api-key', flag: '--xai-api-key', primaryModel: 'xai/grok-3-mini', envVar: 'XAI_API_KEY' }
     };
 
     const config = providerConfig[provider];
@@ -588,6 +588,42 @@ app.post('/setup/onboard', requireAuth, validateCSRF, async (req, res) => {
       }
     } catch (e) {
       // ignore
+    }
+
+    // Write API key to STATE_DIR/.env so the gateway can use it
+    try {
+      const envVar = config.envVar;
+      if (envVar && apiKey) {
+        const envPath = join(STATE_DIR, '.env');
+        let lines = [];
+        if (existsSync(envPath)) {
+          const content = readFileSync(envPath, 'utf-8');
+          lines = content.split(/\r?\n/).filter((line) => {
+            const key = line.replace(/=.*/, '').trim();
+            return key !== envVar;
+          });
+        }
+        lines.push(`${envVar}=${apiKey.replace(/\n/g, '')}`);
+        writeFileSync(envPath, lines.join('\n') + '\n', { mode: 0o600 });
+      }
+    } catch (e) {
+      // ignore
+    }
+
+    // Write API key to main agent's auth-profiles.json (gateway reads this; onboard may not have written it)
+    try {
+      if (apiKey) {
+        execSync(`openclaw models auth paste-token --provider ${provider} --agent main`, {
+          env: onboardEnv,
+          input: apiKey.trim(),
+          encoding: 'utf-8',
+          timeout: 15000,
+          stdio: ['pipe', 'pipe', 'pipe']
+        });
+        addLog(`Auth profile written for ${provider}`);
+      }
+    } catch (pasteErr) {
+      addLog(`paste-token warning: ${pasteErr.message}`);
     }
 
     // Configure channels if provided
@@ -1350,11 +1386,11 @@ function getSetupHTML(csrfToken, sessionId) {
             <label for="provider" class="block text-sm font-medium text-slate-300 mb-2">Which AI do you want to use?</label>
             <div class="relative">
               <select id="provider" name="provider" class="w-full px-4 py-3 rounded-xl bg-slate-800/50 border border-slate-700/50 text-white appearance-none cursor-pointer transition-all duration-200 focus:outline-none focus:border-violet-500/50 input-glow hover:border-slate-600">
-                <option value="anthropic">Claude by Anthropic (Recommended)</option>
+                <option value="minimax">MiniMax (Recommended)</option>
+                <option value="anthropic">Claude by Anthropic (Best quality)</option>
                 <option value="openai">GPT by OpenAI</option>
                 <option value="google">Gemini by Google</option>
                 <option value="openrouter">OpenRouter (Multiple Models)</option>
-                <option value="minimax">MiniMax (Budget-Friendly)</option>
                 <option value="groq">Groq (Fast Inference)</option>
                 <option value="xai">xAI Grok</option>
               </select>
@@ -1365,11 +1401,11 @@ function getSetupHTML(csrfToken, sessionId) {
             <div id="apiKeyLinks" class="mt-3 p-3 rounded-lg bg-slate-800/30 border border-slate-700/30">
               <p class="text-xs text-slate-400 mb-2">Get your API key:</p>
               <div class="flex flex-wrap gap-2">
+                <a href="https://platform.minimax.io/subscribe/coding-plan?code=AlUL2IhlbC&source=link" target="_blank" class="inline-flex items-center gap-1 px-2 py-1 rounded text-xs bg-orange-500/10 text-orange-400 hover:bg-orange-500/20 transition-colors">MiniMax (10% OFF, recommended)</a>
                 <a href="https://console.anthropic.com/settings/keys" target="_blank" class="inline-flex items-center gap-1 px-2 py-1 rounded text-xs bg-violet-500/10 text-violet-400 hover:bg-violet-500/20 transition-colors">Anthropic</a>
                 <a href="https://platform.openai.com/api-keys" target="_blank" class="inline-flex items-center gap-1 px-2 py-1 rounded text-xs bg-emerald-500/10 text-emerald-400 hover:bg-emerald-500/20 transition-colors">OpenAI</a>
                 <a href="https://aistudio.google.com/apikey" target="_blank" class="inline-flex items-center gap-1 px-2 py-1 rounded text-xs bg-blue-500/10 text-blue-400 hover:bg-blue-500/20 transition-colors">Google</a>
                 <a href="https://openrouter.ai/keys" target="_blank" class="inline-flex items-center gap-1 px-2 py-1 rounded text-xs bg-pink-500/10 text-pink-400 hover:bg-pink-500/20 transition-colors">OpenRouter</a>
-                <a href="https://platform.minimax.io/subscribe/coding-plan?code=AlUL2IhlbC&source=link" target="_blank" class="inline-flex items-center gap-1 px-2 py-1 rounded text-xs bg-orange-500/10 text-orange-400 hover:bg-orange-500/20 transition-colors">MiniMax (10% OFF)</a>
                 <a href="https://console.groq.com/keys" target="_blank" class="inline-flex items-center gap-1 px-2 py-1 rounded text-xs bg-cyan-500/10 text-cyan-400 hover:bg-cyan-500/20 transition-colors">Groq</a>
                 <a href="https://console.x.ai" target="_blank" class="inline-flex items-center gap-1 px-2 py-1 rounded text-xs bg-slate-500/10 text-slate-400 hover:bg-slate-500/20 transition-colors">xAI</a>
               </div>
