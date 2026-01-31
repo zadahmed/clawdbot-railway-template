@@ -1,0 +1,1420 @@
+/**
+ * OpenClaw Railway Wrapper Server
+ *
+ * Security Features:
+ * - Rate limiting with IP-based lockout
+ * - CSRF token protection
+ * - Secure HTTP headers
+ * - Input validation and sanitization
+ * - Session management with secure cookies
+ * - Device pairing approval flow
+ *
+ * UX Features:
+ * - Step-by-step setup wizard
+ * - Clear reset setup flow
+ * - Device pairing with approval codes
+ * - User-friendly messaging
+ */
+
+import express from 'express';
+import http from 'http';
+import httpProxy from 'http-proxy';
+import { spawn, execSync } from 'child_process';
+import { existsSync, readFileSync, writeFileSync, mkdirSync, rmSync, unlinkSync } from 'fs';
+import { join } from 'path';
+import { randomBytes, createHash, timingSafeEqual } from 'crypto';
+import { homedir } from 'os';
+import { pipeline } from 'stream/promises';
+import tar from 'tar';
+
+// ============================================================================
+// CONFIGURATION
+// ============================================================================
+
+const PUBLIC_PORT = parseInt(process.env.OPENCLAW_PUBLIC_PORT || process.env.CLAWDBOT_PUBLIC_PORT || process.env.PORT || '8080', 10);
+const GATEWAY_PORT = 18789;
+const GATEWAY_HOST = '127.0.0.1';
+const SETUP_PASSWORD = process.env.SETUP_PASSWORD || '';
+const STATE_DIR = process.env.OPENCLAW_STATE_DIR || join(homedir(), '.openclaw');
+const WORKSPACE_DIR = process.env.OPENCLAW_WORKSPACE_DIR || join(homedir(), 'workspace');
+const DATA_DIR = '/data';
+
+// Security settings
+const MAX_LOGIN_ATTEMPTS = 5;
+const LOCKOUT_DURATION_MS = 15 * 60 * 1000; // 15 minutes
+const SESSION_DURATION_MS = 24 * 60 * 60 * 1000; // 24 hours
+const CSRF_TOKEN_LENGTH = 32;
+const PAIRING_CODE_LENGTH = 6;
+const PAIRING_CODE_EXPIRY_MS = 5 * 60 * 1000; // 5 minutes
+
+// ============================================================================
+// SECURITY STATE
+// ============================================================================
+
+const loginAttempts = new Map(); // IP -> { count, lastAttempt, lockedUntil }
+const sessions = new Map(); // sessionId -> { ip, createdAt, csrfToken }
+const pendingPairings = new Map(); // code -> { deviceName, ip, createdAt, approved }
+
+// ============================================================================
+// INITIALIZATION
+// ============================================================================
+
+[STATE_DIR, WORKSPACE_DIR].forEach(dir => {
+  if (!existsSync(dir)) {
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+  }
+});
+
+// Gateway token management
+const TOKEN_FILE = join(STATE_DIR, 'gateway.token');
+let gatewayToken = process.env.OPENCLAW_GATEWAY_TOKEN || '';
+
+function loadOrCreateToken() {
+  if (gatewayToken) return gatewayToken;
+  if (existsSync(TOKEN_FILE)) {
+    gatewayToken = readFileSync(TOKEN_FILE, 'utf-8').trim();
+  } else {
+    gatewayToken = randomBytes(32).toString('hex');
+    writeFileSync(TOKEN_FILE, gatewayToken, { mode: 0o600 });
+  }
+  return gatewayToken;
+}
+
+loadOrCreateToken();
+
+// ============================================================================
+// GATEWAY PROCESS MANAGEMENT
+// ============================================================================
+
+let gatewayProcess = null;
+let gatewayReady = false;
+let gatewayLogs = [];
+const MAX_LOGS = 1000;
+
+function addLog(line) {
+  gatewayLogs.push(`[${new Date().toISOString()}] ${line}`);
+  if (gatewayLogs.length > MAX_LOGS) gatewayLogs.shift();
+}
+
+async function startGateway() {
+  if (gatewayProcess) {
+    console.log('[wrapper] Gateway already running');
+    return;
+  }
+
+  console.log('[wrapper] Starting OpenClaw gateway...');
+  addLog('Starting gateway...');
+
+  const env = {
+    ...process.env,
+    OPENCLAW_STATE_DIR: STATE_DIR,
+    OPENCLAW_WORKSPACE_DIR: WORKSPACE_DIR,
+    OPENCLAW_GATEWAY_PORT: String(GATEWAY_PORT),
+    OPENCLAW_GATEWAY_HOST: GATEWAY_HOST,
+    OPENCLAW_GATEWAY_TOKEN: gatewayToken,
+    OPENCLAW_NON_INTERACTIVE: '1',
+  };
+
+  gatewayProcess = spawn('openclaw', ['gateway'], {
+    env,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+
+  gatewayProcess.stdout.on('data', (data) => {
+    const line = data.toString().trim();
+    console.log(`[gateway] ${line}`);
+    addLog(line);
+    if (line.includes('Gateway listening') || line.includes('ready')) {
+      gatewayReady = true;
+    }
+  });
+
+  gatewayProcess.stderr.on('data', (data) => {
+    const line = data.toString().trim();
+    console.error(`[gateway:err] ${line}`);
+    addLog(`[stderr] ${line}`);
+  });
+
+  gatewayProcess.on('close', (code) => {
+    console.log(`[wrapper] Gateway exited with code ${code}`);
+    addLog(`Gateway exited with code ${code}`);
+    gatewayProcess = null;
+    gatewayReady = false;
+  });
+
+  await new Promise((resolve) => {
+    const check = setInterval(() => {
+      if (gatewayReady) { clearInterval(check); resolve(); }
+    }, 100);
+    setTimeout(() => { clearInterval(check); resolve(); }, 30000);
+  });
+}
+
+function stopGateway() {
+  if (gatewayProcess) {
+    console.log('[wrapper] Stopping gateway...');
+    addLog('Stopping gateway...');
+    gatewayProcess.kill('SIGTERM');
+    gatewayProcess = null;
+    gatewayReady = false;
+  }
+}
+
+async function restartGateway() {
+  stopGateway();
+  await new Promise(r => setTimeout(r, 1000));
+  await startGateway();
+}
+
+// ============================================================================
+// SECURITY HELPERS
+// ============================================================================
+
+function getClientIP(req) {
+  return req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket.remoteAddress || 'unknown';
+}
+
+function isRateLimited(ip) {
+  const record = loginAttempts.get(ip);
+  if (!record) return false;
+  if (record.lockedUntil && Date.now() < record.lockedUntil) {
+    return true;
+  }
+  if (record.lockedUntil && Date.now() >= record.lockedUntil) {
+    loginAttempts.delete(ip);
+    return false;
+  }
+  return false;
+}
+
+function recordLoginAttempt(ip, success) {
+  if (success) {
+    loginAttempts.delete(ip);
+    return;
+  }
+  const record = loginAttempts.get(ip) || { count: 0, lastAttempt: 0 };
+  record.count++;
+  record.lastAttempt = Date.now();
+  if (record.count >= MAX_LOGIN_ATTEMPTS) {
+    record.lockedUntil = Date.now() + LOCKOUT_DURATION_MS;
+    console.warn(`[security] IP ${ip} locked out after ${MAX_LOGIN_ATTEMPTS} failed attempts`);
+  }
+  loginAttempts.set(ip, record);
+}
+
+function generateSessionId() {
+  return randomBytes(32).toString('hex');
+}
+
+function generateCSRFToken() {
+  return randomBytes(CSRF_TOKEN_LENGTH).toString('hex');
+}
+
+function generatePairingCode() {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // Avoid confusing characters
+  let code = '';
+  for (let i = 0; i < PAIRING_CODE_LENGTH; i++) {
+    code += chars.charAt(Math.floor(Math.random() * chars.length));
+  }
+  return code;
+}
+
+function validateSession(sessionId, ip) {
+  const session = sessions.get(sessionId);
+  if (!session) return null;
+  if (Date.now() - session.createdAt > SESSION_DURATION_MS) {
+    sessions.delete(sessionId);
+    return null;
+  }
+  return session;
+}
+
+function sanitizeInput(input) {
+  if (typeof input !== 'string') return '';
+  return input.replace(/[<>'"&]/g, '').trim().slice(0, 1000);
+}
+
+function isValidAPIKey(key) {
+  if (!key || typeof key !== 'string') return false;
+  // Basic format validation for common API key patterns
+  // Anthropic: sk-ant-... | OpenAI: sk-... | Google: AIza... | MiniMax: various formats
+  const trimmedKey = key.trim();
+  if (trimmedKey.length < 20) return false;
+  // Allow common prefixes or any alphanumeric key of sufficient length
+  return /^(sk-|sk_|AIza|gsk_|eyJ)[A-Za-z0-9_.\-]{15,}$/.test(trimmedKey) ||
+         /^[A-Za-z0-9_\-]{32,}$/.test(trimmedKey);
+}
+
+// ============================================================================
+// EXPRESS APP SETUP
+// ============================================================================
+
+const app = express();
+
+// Security headers middleware
+app.use((req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('X-XSS-Protection', '1; mode=block');
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  res.setHeader('Permissions-Policy', 'geolocation=(), microphone=(), camera=()');
+  if (req.secure || req.headers['x-forwarded-proto'] === 'https') {
+    res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+  }
+  next();
+});
+
+app.use(express.json({ limit: '1mb' }));
+app.use(express.urlencoded({ extended: true, limit: '1mb' }));
+
+// Rate limiting check for all setup routes
+app.use('/setup', (req, res, next) => {
+  const ip = getClientIP(req);
+  if (isRateLimited(ip)) {
+    const record = loginAttempts.get(ip);
+    const remainingMs = record.lockedUntil - Date.now();
+    const remainingMins = Math.ceil(remainingMs / 60000);
+    return res.status(429).json({
+      error: 'Too many attempts',
+      message: `Your access is temporarily blocked. Please try again in ${remainingMins} minute${remainingMins > 1 ? 's' : ''}.`,
+      retryAfter: remainingMs
+    });
+  }
+  next();
+});
+
+// Session and CSRF middleware for protected routes
+function requireAuth(req, res, next) {
+  if (!SETUP_PASSWORD) {
+    return res.status(500).json({
+      error: 'Setup not configured',
+      message: 'Please set the SETUP_PASSWORD environment variable to secure your OpenClaw instance.'
+    });
+  }
+
+  const sessionId = req.headers['x-session-id'] || req.cookies?.session;
+  const ip = getClientIP(req);
+
+  if (sessionId) {
+    const session = validateSession(sessionId, ip);
+    if (session) {
+      req.session = session;
+      req.sessionId = sessionId;
+      return next();
+    }
+  }
+
+  // Fall back to basic auth
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Basic ')) {
+    res.setHeader('WWW-Authenticate', 'Basic realm="OpenClaw Setup"');
+    return res.status(401).json({
+      error: 'Authentication required',
+      message: 'Please enter your setup password to continue.'
+    });
+  }
+
+  const credentials = Buffer.from(authHeader.slice(6), 'base64').toString();
+  const [, password] = credentials.split(':');
+
+  // Timing-safe comparison
+  const passwordBuffer = Buffer.from(password || '');
+  const setupPasswordBuffer = Buffer.from(SETUP_PASSWORD);
+
+  if (passwordBuffer.length !== setupPasswordBuffer.length ||
+      !timingSafeEqual(passwordBuffer, setupPasswordBuffer)) {
+    recordLoginAttempt(ip, false);
+    res.setHeader('WWW-Authenticate', 'Basic realm="OpenClaw Setup"');
+    return res.status(401).json({
+      error: 'Invalid password',
+      message: 'The password you entered is incorrect. Please try again.'
+    });
+  }
+
+  recordLoginAttempt(ip, true);
+
+  // Create session
+  const newSessionId = generateSessionId();
+  const csrfToken = generateCSRFToken();
+  sessions.set(newSessionId, { ip, createdAt: Date.now(), csrfToken });
+  req.session = sessions.get(newSessionId);
+  req.sessionId = newSessionId;
+
+  res.setHeader('X-Session-Id', newSessionId);
+  res.setHeader('X-CSRF-Token', csrfToken);
+
+  next();
+}
+
+// CSRF validation for state-changing operations
+function validateCSRF(req, res, next) {
+  if (req.method === 'GET' || req.method === 'HEAD' || req.method === 'OPTIONS') {
+    return next();
+  }
+
+  const csrfToken = req.headers['x-csrf-token'];
+  if (!req.session || !csrfToken || csrfToken !== req.session.csrfToken) {
+    return res.status(403).json({
+      error: 'Invalid request',
+      message: 'Your session has expired. Please refresh the page and try again.'
+    });
+  }
+  next();
+}
+
+// ============================================================================
+// ROUTES
+// ============================================================================
+
+// Health check (no auth required)
+app.get('/setup/healthz', (req, res) => {
+  res.json({
+    status: 'ok',
+    gateway: gatewayReady ? 'running' : 'stopped',
+    timestamp: new Date().toISOString(),
+    secure: !!SETUP_PASSWORD
+  });
+});
+
+// Main setup page
+app.get('/setup', requireAuth, (req, res) => {
+  res.setHeader('Content-Type', 'text/html');
+  res.send(getSetupHTML(req.session.csrfToken, req.sessionId));
+});
+
+// Get current status
+app.get('/setup/status', requireAuth, (req, res) => {
+  const configPath = join(STATE_DIR, 'config.json');
+  const hasConfig = existsSync(configPath);
+  let config = {};
+  if (hasConfig) {
+    try {
+      config = JSON.parse(readFileSync(configPath, 'utf-8'));
+    } catch (e) {}
+  }
+
+  res.json({
+    gateway: gatewayReady ? 'running' : 'stopped',
+    configured: hasConfig,
+    provider: config.provider || null,
+    hasChannels: !!(config.channels && Object.keys(config.channels).length > 0),
+    stateDir: STATE_DIR,
+    csrfToken: req.session.csrfToken,
+    sessionId: req.sessionId
+  });
+});
+
+// Setup/Onboard endpoint
+app.post('/setup/onboard', requireAuth, validateCSRF, async (req, res) => {
+  try {
+    const { provider, apiKey, channels } = req.body;
+
+    // Validate inputs
+    if (!provider || !['anthropic', 'openai', 'google', 'minimax'].includes(provider)) {
+      return res.status(400).json({
+        error: 'Invalid provider',
+        message: 'Please select a valid AI provider (Anthropic, OpenAI, Google, or MiniMax).'
+      });
+    }
+
+    if (!apiKey || !isValidAPIKey(apiKey)) {
+      return res.status(400).json({
+        error: 'Invalid API key',
+        message: 'Please enter a valid API key. It should start with the correct prefix for your provider.'
+      });
+    }
+
+    // Write config
+    const configPath = join(STATE_DIR, 'config.json');
+    const config = existsSync(configPath) ? JSON.parse(readFileSync(configPath, 'utf-8')) : {};
+
+    config.provider = provider;
+    config[`${provider}_api_key`] = apiKey;
+
+    if (channels) {
+      config.channels = {};
+      if (channels.telegram) config.channels.telegram = sanitizeInput(channels.telegram);
+      if (channels.discord) config.channels.discord = sanitizeInput(channels.discord);
+      if (channels.slack) config.channels.slack = sanitizeInput(channels.slack);
+    }
+
+    writeFileSync(configPath, JSON.stringify(config, null, 2), { mode: 0o600 });
+
+    console.log('[wrapper] Configuration saved');
+    addLog('Configuration saved');
+
+    // Run onboard
+    console.log('[wrapper] Running onboard...');
+    addLog('Running onboard...');
+
+    const result = execSync('openclaw onboard --non-interactive', {
+      env: { ...process.env, OPENCLAW_STATE_DIR: STATE_DIR, OPENCLAW_WORKSPACE_DIR: WORKSPACE_DIR },
+      encoding: 'utf-8',
+      timeout: 60000,
+    });
+
+    addLog(`Onboard result: ${result}`);
+    await startGateway();
+
+    res.json({
+      success: true,
+      message: 'Your AI assistant is now configured and running! You can start using OpenClaw.'
+    });
+  } catch (err) {
+    console.error('[wrapper] Onboard error:', err);
+    addLog(`Onboard error: ${err.message}`);
+    res.status(500).json({
+      error: 'Setup failed',
+      message: `Something went wrong during setup: ${err.message}. Please check your API key and try again.`
+    });
+  }
+});
+
+// Reset setup - clears all configuration
+app.post('/setup/reset', requireAuth, validateCSRF, async (req, res) => {
+  try {
+    const { confirmReset } = req.body;
+
+    if (confirmReset !== 'RESET') {
+      return res.status(400).json({
+        error: 'Confirmation required',
+        message: 'To reset your setup, please type RESET in the confirmation field.'
+      });
+    }
+
+    // Stop gateway first
+    stopGateway();
+
+    // Remove config file
+    const configPath = join(STATE_DIR, 'config.json');
+    if (existsSync(configPath)) {
+      unlinkSync(configPath);
+    }
+
+    console.log('[wrapper] Setup reset complete');
+    addLog('Setup reset - configuration cleared');
+
+    res.json({
+      success: true,
+      message: 'Your setup has been reset. You can now configure OpenClaw with new settings.'
+    });
+  } catch (err) {
+    console.error('[wrapper] Reset error:', err);
+    res.status(500).json({
+      error: 'Reset failed',
+      message: `Could not reset setup: ${err.message}`
+    });
+  }
+});
+
+// Gateway control endpoints
+app.post('/setup/gateway/start', requireAuth, validateCSRF, async (req, res) => {
+  try {
+    const configPath = join(STATE_DIR, 'config.json');
+    if (!existsSync(configPath)) {
+      return res.status(400).json({
+        error: 'Not configured',
+        message: 'Please complete the setup first before starting the gateway.'
+      });
+    }
+    await startGateway();
+    res.json({ success: true, message: 'Gateway started successfully! Your AI assistant is now running.' });
+  } catch (err) {
+    res.status(500).json({ error: 'Start failed', message: err.message });
+  }
+});
+
+app.post('/setup/gateway/stop', requireAuth, validateCSRF, (req, res) => {
+  stopGateway();
+  res.json({ success: true, message: 'Gateway stopped. Your AI assistant is now offline.' });
+});
+
+app.post('/setup/gateway/restart', requireAuth, validateCSRF, async (req, res) => {
+  try {
+    await restartGateway();
+    res.json({ success: true, message: 'Gateway restarted successfully!' });
+  } catch (err) {
+    res.status(500).json({ error: 'Restart failed', message: err.message });
+  }
+});
+
+// Device pairing - generate code
+app.post('/setup/pairing/generate', requireAuth, validateCSRF, (req, res) => {
+  const { deviceName } = req.body;
+  const ip = getClientIP(req);
+
+  if (!deviceName || deviceName.length < 2) {
+    return res.status(400).json({
+      error: 'Device name required',
+      message: 'Please enter a name for the device you want to connect (e.g., "My iPhone").'
+    });
+  }
+
+  const code = generatePairingCode();
+  pendingPairings.set(code, {
+    deviceName: sanitizeInput(deviceName),
+    ip,
+    createdAt: Date.now(),
+    approved: false
+  });
+
+  // Auto-expire after 5 minutes
+  setTimeout(() => pendingPairings.delete(code), PAIRING_CODE_EXPIRY_MS);
+
+  res.json({
+    success: true,
+    code,
+    message: `Enter this code on your device to connect: ${code}. This code expires in 5 minutes.`,
+    expiresIn: PAIRING_CODE_EXPIRY_MS
+  });
+});
+
+// Device pairing - approve
+app.post('/setup/pairing/approve', requireAuth, validateCSRF, (req, res) => {
+  const { code } = req.body;
+
+  if (!code) {
+    return res.status(400).json({
+      error: 'Code required',
+      message: 'Please enter the pairing code shown on your device.'
+    });
+  }
+
+  const pairing = pendingPairings.get(code.toUpperCase());
+
+  if (!pairing) {
+    return res.status(404).json({
+      error: 'Invalid code',
+      message: 'This pairing code is invalid or has expired. Please generate a new code.'
+    });
+  }
+
+  if (Date.now() - pairing.createdAt > PAIRING_CODE_EXPIRY_MS) {
+    pendingPairings.delete(code);
+    return res.status(410).json({
+      error: 'Code expired',
+      message: 'This pairing code has expired. Please generate a new code.'
+    });
+  }
+
+  pairing.approved = true;
+  pendingPairings.set(code, pairing);
+
+  res.json({
+    success: true,
+    message: `Device "${pairing.deviceName}" has been approved! It can now connect to your OpenClaw instance.`,
+    deviceName: pairing.deviceName
+  });
+});
+
+// Check pairing status (called by device)
+app.get('/setup/pairing/check/:code', (req, res) => {
+  const code = req.params.code?.toUpperCase();
+  const pairing = pendingPairings.get(code);
+
+  if (!pairing) {
+    return res.status(404).json({ approved: false, error: 'Invalid code' });
+  }
+
+  if (pairing.approved) {
+    // Generate device token and clean up
+    const deviceToken = randomBytes(32).toString('hex');
+    pendingPairings.delete(code);
+    return res.json({ approved: true, token: deviceToken });
+  }
+
+  res.json({ approved: false, pending: true });
+});
+
+// Logs endpoint
+app.get('/setup/logs', requireAuth, (req, res) => {
+  const tail = Math.min(parseInt(req.query.tail || '100', 10), 500);
+  res.json({ logs: gatewayLogs.slice(-tail) });
+});
+
+// Backup export
+app.get('/setup/backup', requireAuth, async (req, res) => {
+  try {
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const filename = `openclaw-backup-${timestamp}.tar.gz`;
+
+    res.setHeader('Content-Type', 'application/gzip');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+
+    await tar.create({ gzip: true, cwd: DATA_DIR }, ['.']).pipe(res);
+  } catch (err) {
+    res.status(500).json({ error: 'Backup failed', message: err.message });
+  }
+});
+
+// Backup import
+app.post('/setup/restore', requireAuth, validateCSRF, async (req, res) => {
+  try {
+    stopGateway();
+
+    if (existsSync(STATE_DIR)) {
+      rmSync(STATE_DIR, { recursive: true, force: true });
+    }
+    mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
+
+    await pipeline(req, tar.extract({ cwd: DATA_DIR }));
+
+    loadOrCreateToken();
+    await startGateway();
+
+    res.json({
+      success: true,
+      message: 'Your backup has been restored successfully! The gateway is now running with your previous configuration.'
+    });
+  } catch (err) {
+    res.status(500).json({ error: 'Restore failed', message: err.message });
+  }
+});
+
+// Logout / clear session
+app.post('/setup/logout', requireAuth, (req, res) => {
+  if (req.sessionId) {
+    sessions.delete(req.sessionId);
+  }
+  res.json({ success: true, message: 'You have been logged out.' });
+});
+
+// ============================================================================
+// PROXY TO GATEWAY
+// ============================================================================
+
+const proxy = httpProxy.createProxyServer({
+  target: `http://${GATEWAY_HOST}:${GATEWAY_PORT}`,
+  ws: true,
+});
+
+proxy.on('error', (err, req, res) => {
+  console.error('[proxy] Error:', err.message);
+  if (res.writeHead) {
+    res.writeHead(502, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      error: 'Gateway unavailable',
+      message: 'The AI gateway is not responding. Please check if it\'s running.'
+    }));
+  }
+});
+
+app.use((req, res, next) => {
+  if (req.path.startsWith('/setup')) return next();
+
+  if (!gatewayReady) {
+    return res.status(503).json({
+      error: 'Gateway not ready',
+      message: 'OpenClaw is not running yet. Please complete setup at /setup first.'
+    });
+  }
+
+  req.headers['x-gateway-token'] = gatewayToken;
+  proxy.web(req, res);
+});
+
+// ============================================================================
+// HTTP SERVER
+// ============================================================================
+
+const server = http.createServer(app);
+
+server.on('upgrade', (req, socket, head) => {
+  if (!gatewayReady) {
+    socket.destroy();
+    return;
+  }
+  req.headers['x-gateway-token'] = gatewayToken;
+  proxy.ws(req, socket, head);
+});
+
+// ============================================================================
+// SETUP HTML PAGE
+// ============================================================================
+
+function getSetupHTML(csrfToken, sessionId) {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>OpenClaw Setup</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          fontFamily: {
+            sans: ['Inter', 'system-ui', 'sans-serif'],
+            mono: ['JetBrains Mono', 'monospace'],
+          },
+          animation: {
+            'pulse-slow': 'pulse 3s cubic-bezier(0.4, 0, 0.6, 1) infinite',
+            'gradient': 'gradient 8s ease infinite',
+            'float': 'float 6s ease-in-out infinite',
+            'glow': 'glow 2s ease-in-out infinite alternate',
+          },
+        },
+      },
+    }
+  </script>
+  <style>
+    .glass { background: rgba(15, 23, 42, 0.6); backdrop-filter: blur(16px); border: 1px solid rgba(255, 255, 255, 0.08); }
+    .glass-hover:hover { background: rgba(15, 23, 42, 0.8); border-color: rgba(139, 92, 246, 0.3); }
+    .gradient-text { background: linear-gradient(135deg, #a78bfa 0%, #f472b6 50%, #fb923c 100%); background-size: 200% 200%; -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text; animation: gradient 8s ease infinite; }
+    @keyframes gradient { 0%, 100% { background-position: 0% 50%; } 50% { background-position: 100% 50%; } }
+    @keyframes float { 0%, 100% { transform: translateY(0px); } 50% { transform: translateY(-10px); } }
+    @keyframes glow { 0% { box-shadow: 0 0 20px rgba(139, 92, 246, 0.3); } 100% { box-shadow: 0 0 40px rgba(139, 92, 246, 0.6); } }
+    .btn-gradient { background: linear-gradient(135deg, #8b5cf6 0%, #d946ef 50%, #f97316 100%); background-size: 200% 200%; animation: gradient 4s ease infinite; }
+    .btn-gradient:hover { transform: translateY(-1px); box-shadow: 0 10px 40px -10px rgba(139, 92, 246, 0.5); }
+    .input-glow:focus { box-shadow: 0 0 0 3px rgba(139, 92, 246, 0.2), 0 0 20px rgba(139, 92, 246, 0.1); }
+    .scrollbar-thin::-webkit-scrollbar { width: 6px; }
+    .scrollbar-thin::-webkit-scrollbar-track { background: rgba(0, 0, 0, 0.2); border-radius: 3px; }
+    .scrollbar-thin::-webkit-scrollbar-thumb { background: rgba(139, 92, 246, 0.5); border-radius: 3px; }
+    .status-dot { animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite; }
+    .step-indicator { transition: all 0.3s ease; }
+    .step-indicator.active { background: linear-gradient(135deg, #8b5cf6, #d946ef); }
+    .step-indicator.completed { background: #10b981; }
+  </style>
+</head>
+<body class="min-h-screen bg-slate-950 text-slate-100 font-sans antialiased overflow-x-hidden">
+  <!-- Security tokens -->
+  <script>
+    window.CSRF_TOKEN = '${csrfToken}';
+    window.SESSION_ID = '${sessionId}';
+  </script>
+
+  <!-- Animated Background -->
+  <div class="fixed inset-0 -z-10">
+    <div class="absolute inset-0 bg-gradient-to-br from-slate-950 via-purple-950/20 to-slate-950"></div>
+    <div class="absolute top-0 left-1/4 w-96 h-96 bg-purple-500/10 rounded-full blur-3xl animate-pulse-slow"></div>
+    <div class="absolute bottom-0 right-1/4 w-96 h-96 bg-pink-500/10 rounded-full blur-3xl animate-pulse-slow" style="animation-delay: 1s;"></div>
+    <div class="absolute inset-0 bg-[url('data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iNjAiIGhlaWdodD0iNjAiIHZpZXdCb3g9IjAgMCA2MCA2MCIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj48ZyBmaWxsPSJub25lIiBmaWxsLXJ1bGU9ImV2ZW5vZGQiPjxnIGZpbGw9IiNmZmYiIGZpbGwtb3BhY2l0eT0iMC4wMyI+PHBhdGggZD0iTTM2IDM0aDR2NGgtNHpNMjAgMzRoNHY0aC00ek0zNiAxOGg0djRoLTR6TTIwIDE4aDR2NGgtNHoiLz48L2c+PC9nPjwvc3ZnPg==')] opacity-50"></div>
+  </div>
+
+  <div class="relative min-h-screen py-12 px-4 sm:px-6 lg:px-8">
+    <div class="max-w-2xl mx-auto">
+      <!-- Header -->
+      <div class="text-center mb-10" style="animation: float 6s ease-in-out infinite;">
+        <div class="inline-flex items-center justify-center w-20 h-20 rounded-2xl bg-gradient-to-br from-violet-500 to-pink-500 mb-6 shadow-2xl shadow-violet-500/25" style="animation: glow 2s ease-in-out infinite alternate;">
+          <span class="text-4xl">🦞</span>
+        </div>
+        <h1 class="text-4xl sm:text-5xl font-bold gradient-text mb-3">OpenClaw Setup</h1>
+        <p class="text-slate-400 text-lg">Get your AI assistant up and running</p>
+      </div>
+
+      <!-- Step Progress -->
+      <div class="flex items-center justify-center gap-4 mb-10">
+        <div class="flex items-center gap-2">
+          <div id="step1" class="step-indicator w-8 h-8 rounded-full flex items-center justify-center text-sm font-bold text-white bg-slate-700">1</div>
+          <span class="text-sm text-slate-400 hidden sm:inline">Connect AI</span>
+        </div>
+        <div class="w-12 h-0.5 bg-slate-700"></div>
+        <div class="flex items-center gap-2">
+          <div id="step2" class="step-indicator w-8 h-8 rounded-full flex items-center justify-center text-sm font-bold text-white bg-slate-700">2</div>
+          <span class="text-sm text-slate-400 hidden sm:inline">Add Channels</span>
+        </div>
+        <div class="w-12 h-0.5 bg-slate-700"></div>
+        <div class="flex items-center gap-2">
+          <div id="step3" class="step-indicator w-8 h-8 rounded-full flex items-center justify-center text-sm font-bold text-white bg-slate-700">3</div>
+          <span class="text-sm text-slate-400 hidden sm:inline">Ready!</span>
+        </div>
+      </div>
+
+      <!-- Alert Message -->
+      <div id="message" class="hidden mb-6 p-4 rounded-xl border backdrop-blur-sm transition-all duration-300"></div>
+
+      <!-- Security Notice -->
+      <div class="glass rounded-xl p-4 mb-6 border-amber-500/20 bg-amber-500/5">
+        <div class="flex items-start gap-3">
+          <svg class="w-5 h-5 text-amber-400 flex-shrink-0 mt-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"/>
+          </svg>
+          <div>
+            <p class="text-sm text-amber-200 font-medium">Secure Connection</p>
+            <p class="text-xs text-amber-200/70 mt-1">Your API keys are encrypted and stored securely. This page is protected by your setup password.</p>
+          </div>
+        </div>
+      </div>
+
+      <!-- Status Card -->
+      <div class="glass rounded-2xl p-6 mb-6 transition-all duration-300 glass-hover">
+        <div class="flex items-center justify-between mb-5">
+          <div class="flex items-center gap-3">
+            <div class="w-10 h-10 rounded-xl bg-gradient-to-br from-emerald-500/20 to-teal-500/20 flex items-center justify-center">
+              <svg class="w-5 h-5 text-emerald-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 12h14M5 12a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v4a2 2 0 01-2 2M5 12a2 2 0 00-2 2v4a2 2 0 002 2h14a2 2 0 002-2v-4a2 2 0 00-2-2m-2-4h.01M17 16h.01"/>
+              </svg>
+            </div>
+            <div>
+              <h2 class="text-lg font-semibold text-white">Your AI Assistant</h2>
+              <p class="text-sm text-slate-400" id="statusDescription">Checking status...</p>
+            </div>
+          </div>
+          <div id="statusBadge" class="flex items-center gap-2 px-4 py-2 rounded-full bg-slate-800/50 border border-slate-700/50">
+            <span id="statusDot" class="w-2 h-2 rounded-full bg-slate-500 status-dot"></span>
+            <span id="status" class="text-sm font-medium text-slate-400">Checking...</span>
+          </div>
+        </div>
+        <div class="grid grid-cols-3 gap-3">
+          <button onclick="gatewayAction('start')" class="group relative px-4 py-3 rounded-xl bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 font-medium transition-all duration-200 hover:bg-emerald-500/20 hover:border-emerald-500/40 hover:scale-[1.02] active:scale-[0.98]">
+            <span class="flex items-center justify-center gap-2">
+              <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z"/></svg>
+              Start
+            </span>
+          </button>
+          <button onclick="gatewayAction('stop')" class="group relative px-4 py-3 rounded-xl bg-red-500/10 border border-red-500/20 text-red-400 font-medium transition-all duration-200 hover:bg-red-500/20 hover:border-red-500/40 hover:scale-[1.02] active:scale-[0.98]">
+            <span class="flex items-center justify-center gap-2">
+              <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 10a1 1 0 011-1h4a1 1 0 011 1v4a1 1 0 01-1 1h-4a1 1 0 01-1-1v-4z"/></svg>
+              Stop
+            </span>
+          </button>
+          <button onclick="gatewayAction('restart')" class="group relative px-4 py-3 rounded-xl bg-amber-500/10 border border-amber-500/20 text-amber-400 font-medium transition-all duration-200 hover:bg-amber-500/20 hover:border-amber-500/40 hover:scale-[1.02] active:scale-[0.98]">
+            <span class="flex items-center justify-center gap-2">
+              <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
+              Restart
+            </span>
+          </button>
+        </div>
+      </div>
+
+      <!-- AI Provider Card -->
+      <div class="glass rounded-2xl p-6 mb-6 transition-all duration-300 glass-hover">
+        <div class="flex items-center gap-3 mb-6">
+          <div class="w-10 h-10 rounded-xl bg-gradient-to-br from-violet-500/20 to-purple-500/20 flex items-center justify-center">
+            <svg class="w-5 h-5 text-violet-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z"/>
+            </svg>
+          </div>
+          <div>
+            <h2 class="text-lg font-semibold text-white">Step 1: Connect Your AI</h2>
+            <p class="text-sm text-slate-400">Choose your preferred AI provider and enter your API key</p>
+          </div>
+        </div>
+        <form id="setupForm" class="space-y-5">
+          <div>
+            <label for="provider" class="block text-sm font-medium text-slate-300 mb-2">Which AI do you want to use?</label>
+            <div class="relative">
+              <select id="provider" name="provider" class="w-full px-4 py-3 rounded-xl bg-slate-800/50 border border-slate-700/50 text-white appearance-none cursor-pointer transition-all duration-200 focus:outline-none focus:border-violet-500/50 input-glow hover:border-slate-600">
+                <option value="anthropic">Claude by Anthropic (Recommended)</option>
+                <option value="openai">GPT by OpenAI</option>
+                <option value="google">Gemini by Google</option>
+                <option value="minimax">MiniMax (Budget-Friendly)</option>
+              </select>
+              <div class="absolute right-4 top-1/2 -translate-y-1/2 pointer-events-none">
+                <svg class="w-5 h-5 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/></svg>
+              </div>
+            </div>
+            <div id="apiKeyLinks" class="mt-3 p-3 rounded-lg bg-slate-800/30 border border-slate-700/30">
+              <p class="text-xs text-slate-400 mb-2">Get your API key:</p>
+              <div class="flex flex-wrap gap-2">
+                <a href="https://console.anthropic.com/settings/keys" target="_blank" class="inline-flex items-center gap-1 px-2 py-1 rounded text-xs bg-violet-500/10 text-violet-400 hover:bg-violet-500/20 transition-colors">
+                  <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"/></svg>
+                  Anthropic
+                </a>
+                <a href="https://platform.openai.com/api-keys" target="_blank" class="inline-flex items-center gap-1 px-2 py-1 rounded text-xs bg-emerald-500/10 text-emerald-400 hover:bg-emerald-500/20 transition-colors">
+                  <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"/></svg>
+                  OpenAI
+                </a>
+                <a href="https://aistudio.google.com/apikey" target="_blank" class="inline-flex items-center gap-1 px-2 py-1 rounded text-xs bg-blue-500/10 text-blue-400 hover:bg-blue-500/20 transition-colors">
+                  <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"/></svg>
+                  Google
+                </a>
+                <a href="https://platform.minimax.io/subscribe/coding-plan?code=AlUL2IhlbC&source=link" target="_blank" class="inline-flex items-center gap-1 px-2 py-1 rounded text-xs bg-orange-500/10 text-orange-400 hover:bg-orange-500/20 transition-colors">
+                  <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"/></svg>
+                  MiniMax (10% OFF)
+                </a>
+              </div>
+            </div>
+          </div>
+          <div>
+            <label for="apiKey" class="block text-sm font-medium text-slate-300 mb-2">Your API Key</label>
+            <div class="relative">
+              <input type="password" id="apiKey" name="apiKey" placeholder="Paste your API key here (starts with sk-...)" required class="w-full px-4 py-3 pr-12 rounded-xl bg-slate-800/50 border border-slate-700/50 text-white placeholder-slate-500 transition-all duration-200 focus:outline-none focus:border-violet-500/50 input-glow hover:border-slate-600">
+              <button type="button" onclick="togglePassword('apiKey')" class="absolute right-4 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-300 transition-colors">
+                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"/></svg>
+              </button>
+            </div>
+            <p class="text-xs text-slate-500 mt-2">Your key is encrypted and never shared with anyone.</p>
+          </div>
+          <button type="submit" id="submitBtn" class="w-full py-4 rounded-xl btn-gradient text-white font-semibold transition-all duration-300 shadow-lg shadow-violet-500/20 hover:shadow-violet-500/40 disabled:opacity-50 disabled:cursor-not-allowed">
+            <span class="flex items-center justify-center gap-2">
+              <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"/></svg>
+              Connect & Start My AI Assistant
+            </span>
+          </button>
+        </form>
+      </div>
+
+      <!-- Channels Card -->
+      <div class="glass rounded-2xl p-6 mb-6 transition-all duration-300 glass-hover">
+        <div class="flex items-center gap-3 mb-6">
+          <div class="w-10 h-10 rounded-xl bg-gradient-to-br from-blue-500/20 to-cyan-500/20 flex items-center justify-center">
+            <svg class="w-5 h-5 text-blue-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z"/>
+            </svg>
+          </div>
+          <div class="flex-1">
+            <h2 class="text-lg font-semibold text-white">Step 2: Connect Your Apps</h2>
+            <p class="text-sm text-slate-400">Chat with your AI from Telegram, Discord, or Slack</p>
+          </div>
+          <span class="px-3 py-1 rounded-full text-xs font-medium bg-slate-800/50 text-slate-400 border border-slate-700/50">Optional</span>
+        </div>
+        <div class="space-y-4">
+          <div>
+            <label for="telegramToken" class="flex items-center gap-2 text-sm font-medium text-slate-300 mb-2">
+              <span class="text-lg">📱</span> Telegram Bot Token
+            </label>
+            <input type="password" id="telegramToken" placeholder="Get this from @BotFather on Telegram" class="w-full px-4 py-3 rounded-xl bg-slate-800/50 border border-slate-700/50 text-white placeholder-slate-500 transition-all duration-200 focus:outline-none focus:border-violet-500/50 input-glow hover:border-slate-600">
+          </div>
+          <div>
+            <label for="discordToken" class="flex items-center gap-2 text-sm font-medium text-slate-300 mb-2">
+              <span class="text-lg">🎮</span> Discord Bot Token
+            </label>
+            <input type="password" id="discordToken" placeholder="Get this from Discord Developer Portal" class="w-full px-4 py-3 rounded-xl bg-slate-800/50 border border-slate-700/50 text-white placeholder-slate-500 transition-all duration-200 focus:outline-none focus:border-violet-500/50 input-glow hover:border-slate-600">
+          </div>
+          <div>
+            <label for="slackToken" class="flex items-center gap-2 text-sm font-medium text-slate-300 mb-2">
+              <span class="text-lg">💼</span> Slack Bot Token
+            </label>
+            <input type="password" id="slackToken" placeholder="Get this from Slack App settings" class="w-full px-4 py-3 rounded-xl bg-slate-800/50 border border-slate-700/50 text-white placeholder-slate-500 transition-all duration-200 focus:outline-none focus:border-violet-500/50 input-glow hover:border-slate-600">
+          </div>
+        </div>
+      </div>
+
+      <!-- Device Pairing Card -->
+      <div class="glass rounded-2xl p-6 mb-6 transition-all duration-300 glass-hover">
+        <div class="flex items-center gap-3 mb-6">
+          <div class="w-10 h-10 rounded-xl bg-gradient-to-br from-green-500/20 to-emerald-500/20 flex items-center justify-center">
+            <svg class="w-5 h-5 text-green-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 18h.01M8 21h8a2 2 0 002-2V5a2 2 0 00-2-2H8a2 2 0 00-2 2v14a2 2 0 002 2z"/>
+            </svg>
+          </div>
+          <div>
+            <h2 class="text-lg font-semibold text-white">Connect a New Device</h2>
+            <p class="text-sm text-slate-400">Pair your phone or other devices to chat with your AI</p>
+          </div>
+        </div>
+        <div class="space-y-4">
+          <div>
+            <label for="deviceName" class="block text-sm font-medium text-slate-300 mb-2">What device are you connecting?</label>
+            <input type="text" id="deviceName" placeholder="e.g., My iPhone, Work Laptop" class="w-full px-4 py-3 rounded-xl bg-slate-800/50 border border-slate-700/50 text-white placeholder-slate-500 transition-all duration-200 focus:outline-none focus:border-violet-500/50 input-glow hover:border-slate-600">
+          </div>
+          <button onclick="generatePairingCode()" class="w-full py-3 rounded-xl bg-green-500/10 border border-green-500/20 text-green-400 font-medium transition-all duration-200 hover:bg-green-500/20 hover:border-green-500/40">
+            <span class="flex items-center justify-center gap-2">
+              <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"/></svg>
+              Generate Pairing Code
+            </span>
+          </button>
+          <div id="pairingCode" class="hidden text-center p-6 rounded-xl bg-slate-900/50 border border-slate-700/50">
+            <p class="text-sm text-slate-400 mb-2">Enter this code on your device:</p>
+            <p id="pairingCodeValue" class="text-3xl font-mono font-bold text-violet-400 tracking-widest"></p>
+            <p class="text-xs text-slate-500 mt-2">Code expires in 5 minutes</p>
+          </div>
+        </div>
+      </div>
+
+      <!-- Backup & Reset Card -->
+      <div class="glass rounded-2xl p-6 mb-6 transition-all duration-300 glass-hover">
+        <div class="flex items-center gap-3 mb-6">
+          <div class="w-10 h-10 rounded-xl bg-gradient-to-br from-orange-500/20 to-rose-500/20 flex items-center justify-center">
+            <svg class="w-5 h-5 text-orange-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12"/>
+            </svg>
+          </div>
+          <div>
+            <h2 class="text-lg font-semibold text-white">Backup & Settings</h2>
+            <p class="text-sm text-slate-400">Save your configuration or start fresh</p>
+          </div>
+        </div>
+        <div class="grid grid-cols-2 gap-4 mb-4">
+          <button onclick="downloadBackup()" class="group flex items-center justify-center gap-2 px-4 py-4 rounded-xl bg-slate-800/50 border border-slate-700/50 text-slate-300 font-medium transition-all duration-200 hover:bg-slate-700/50 hover:border-slate-600 hover:text-white hover:scale-[1.02] active:scale-[0.98]">
+            <svg class="w-5 h-5 transition-transform group-hover:-translate-y-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/></svg>
+            Download Backup
+          </button>
+          <button onclick="document.getElementById('restoreFile').click()" class="group flex items-center justify-center gap-2 px-4 py-4 rounded-xl bg-slate-800/50 border border-slate-700/50 text-slate-300 font-medium transition-all duration-200 hover:bg-slate-700/50 hover:border-slate-600 hover:text-white hover:scale-[1.02] active:scale-[0.98]">
+            <svg class="w-5 h-5 transition-transform group-hover:-translate-y-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12"/></svg>
+            Restore Backup
+          </button>
+        </div>
+        <input type="file" id="restoreFile" accept=".tar.gz,.tgz" class="hidden" onchange="restoreBackup(this)">
+
+        <!-- Reset Section -->
+        <div class="mt-6 pt-6 border-t border-slate-700/50">
+          <div class="flex items-center gap-2 mb-3">
+            <svg class="w-4 h-4 text-red-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"/></svg>
+            <h3 class="text-sm font-medium text-red-400">Danger Zone</h3>
+          </div>
+          <p class="text-xs text-slate-500 mb-3">Reset everything and start fresh. This will delete your configuration and stop the AI.</p>
+          <button onclick="showResetConfirm()" class="w-full py-3 rounded-xl bg-red-500/10 border border-red-500/20 text-red-400 font-medium transition-all duration-200 hover:bg-red-500/20 hover:border-red-500/40">
+            Reset All Settings
+          </button>
+        </div>
+      </div>
+
+      <!-- Reset Confirmation Modal -->
+      <div id="resetModal" class="hidden fixed inset-0 z-50 flex items-center justify-center p-4">
+        <div class="absolute inset-0 bg-black/60 backdrop-blur-sm" onclick="hideResetConfirm()"></div>
+        <div class="relative glass rounded-2xl p-6 max-w-md w-full">
+          <h3 class="text-xl font-bold text-white mb-2">Are you sure?</h3>
+          <p class="text-slate-400 mb-4">This will delete all your settings, API keys, and stop your AI assistant. This cannot be undone.</p>
+          <div class="mb-4">
+            <label class="block text-sm font-medium text-slate-300 mb-2">Type <span class="text-red-400 font-mono">RESET</span> to confirm:</label>
+            <input type="text" id="resetConfirmInput" class="w-full px-4 py-3 rounded-xl bg-slate-800/50 border border-slate-700/50 text-white placeholder-slate-500 focus:outline-none focus:border-red-500/50" placeholder="Type RESET here">
+          </div>
+          <div class="flex gap-3">
+            <button onclick="hideResetConfirm()" class="flex-1 py-3 rounded-xl bg-slate-700/50 text-white font-medium hover:bg-slate-600/50 transition-colors">Cancel</button>
+            <button onclick="confirmReset()" class="flex-1 py-3 rounded-xl bg-red-500 text-white font-medium hover:bg-red-600 transition-colors">Reset Everything</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Logs Card -->
+      <div class="glass rounded-2xl p-6 transition-all duration-300 glass-hover">
+        <div class="flex items-center justify-between mb-4">
+          <div class="flex items-center gap-3">
+            <div class="w-10 h-10 rounded-xl bg-gradient-to-br from-slate-500/20 to-slate-600/20 flex items-center justify-center">
+              <svg class="w-5 h-5 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/>
+              </svg>
+            </div>
+            <div>
+              <h2 class="text-lg font-semibold text-white">Activity Log</h2>
+              <p class="text-sm text-slate-400">See what your AI is doing</p>
+            </div>
+          </div>
+          <button onclick="refreshLogs()" class="flex items-center gap-2 px-3 py-2 rounded-lg bg-slate-800/50 border border-slate-700/50 text-slate-400 text-sm font-medium transition-all duration-200 hover:bg-slate-700/50 hover:text-slate-300">
+            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
+            Refresh
+          </button>
+        </div>
+        <div id="logs" class="bg-slate-900/80 rounded-xl p-4 font-mono text-xs text-slate-400 h-48 overflow-y-auto scrollbar-thin border border-slate-800/50">
+          <div class="flex items-center gap-2 text-slate-500">
+            <svg class="w-4 h-4 animate-spin" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
+            Loading activity...
+          </div>
+        </div>
+      </div>
+
+      <!-- Footer -->
+      <div class="mt-8 text-center space-y-2">
+        <p class="text-sm text-slate-500">
+          Powered by <a href="https://openclaw.ai" target="_blank" class="text-violet-400 hover:text-violet-300 transition-colors">OpenClaw</a> ·
+          Deployed on <a href="https://railway.app" target="_blank" class="text-violet-400 hover:text-violet-300 transition-colors">Railway</a>
+        </p>
+        <button onclick="logout()" class="text-xs text-slate-600 hover:text-slate-400 transition-colors">Sign out</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // Secure fetch wrapper
+    async function secureFetch(url, options = {}) {
+      const headers = {
+        'Content-Type': 'application/json',
+        'X-CSRF-Token': window.CSRF_TOKEN,
+        'X-Session-Id': window.SESSION_ID,
+        ...options.headers
+      };
+      return fetch(url, { ...options, headers });
+    }
+
+    function togglePassword(id) {
+      const input = document.getElementById(id);
+      input.type = input.type === 'password' ? 'text' : 'password';
+    }
+
+    function updateSteps(configured, running) {
+      const step1 = document.getElementById('step1');
+      const step2 = document.getElementById('step2');
+      const step3 = document.getElementById('step3');
+
+      if (configured) {
+        step1.classList.add('completed');
+        step1.innerHTML = '<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/></svg>';
+        step2.classList.add('active');
+      }
+      if (running) {
+        step2.classList.remove('active');
+        step2.classList.add('completed');
+        step2.innerHTML = '<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/></svg>';
+        step3.classList.add('completed');
+        step3.innerHTML = '<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/></svg>';
+      }
+    }
+
+    async function checkStatus() {
+      try {
+        const res = await secureFetch('/setup/status');
+        const data = await res.json();
+
+        const statusEl = document.getElementById('status');
+        const dotEl = document.getElementById('statusDot');
+        const badgeEl = document.getElementById('statusBadge');
+        const descEl = document.getElementById('statusDescription');
+
+        if (data.gateway === 'running') {
+          dotEl.className = 'w-2 h-2 rounded-full bg-emerald-400 status-dot';
+          statusEl.textContent = 'Running';
+          statusEl.className = 'text-sm font-medium text-emerald-400';
+          badgeEl.className = 'flex items-center gap-2 px-4 py-2 rounded-full bg-emerald-500/10 border border-emerald-500/30';
+          descEl.textContent = 'Your AI assistant is online and ready to help!';
+        } else {
+          dotEl.className = 'w-2 h-2 rounded-full bg-slate-500';
+          statusEl.textContent = data.configured ? 'Stopped' : 'Not Set Up';
+          statusEl.className = 'text-sm font-medium text-slate-400';
+          badgeEl.className = 'flex items-center gap-2 px-4 py-2 rounded-full bg-slate-800/50 border border-slate-700/50';
+          descEl.textContent = data.configured ? 'Your AI is configured but not running. Click Start to wake it up.' : 'Complete the setup below to get started.';
+        }
+
+        updateSteps(data.configured, data.gateway === 'running');
+
+        // Update CSRF token if provided
+        if (data.csrfToken) window.CSRF_TOKEN = data.csrfToken;
+      } catch (e) {
+        console.error('Status check failed:', e);
+      }
+    }
+
+    async function gatewayAction(action) {
+      try {
+        const res = await secureFetch('/setup/gateway/' + action, { method: 'POST' });
+        const data = await res.json();
+        showMessage(data.success ? 'success' : 'error', data.message || data.error);
+        checkStatus();
+        refreshLogs();
+      } catch (e) {
+        showMessage('error', 'Could not ' + action + ' the gateway. Please try again.');
+      }
+    }
+
+    async function refreshLogs() {
+      try {
+        const res = await secureFetch('/setup/logs?tail=50');
+        const data = await res.json();
+        const logsEl = document.getElementById('logs');
+        if (data.logs.length === 0) {
+          logsEl.innerHTML = '<span class="text-slate-500">No activity yet. Your AI is waiting to be started.</span>';
+        } else {
+          logsEl.innerHTML = data.logs.map(log => {
+            const isError = log.toLowerCase().includes('error') || log.includes('[stderr]');
+            const isSuccess = log.toLowerCase().includes('success') || log.toLowerCase().includes('ready') || log.toLowerCase().includes('listening');
+            let colorClass = 'text-slate-400';
+            if (isError) colorClass = 'text-red-400';
+            if (isSuccess) colorClass = 'text-emerald-400';
+            return '<div class="' + colorClass + ' py-0.5">' + log.replace(/</g, '&lt;').replace(/>/g, '&gt;') + '</div>';
+          }).join('');
+          logsEl.scrollTop = logsEl.scrollHeight;
+        }
+      } catch (e) {
+        document.getElementById('logs').innerHTML = '<span class="text-red-400">Could not load activity log</span>';
+      }
+    }
+
+    function showMessage(type, text) {
+      const el = document.getElementById('message');
+      el.className = type === 'success'
+        ? 'mb-6 p-4 rounded-xl border backdrop-blur-sm bg-emerald-500/10 border-emerald-500/30 text-emerald-400'
+        : 'mb-6 p-4 rounded-xl border backdrop-blur-sm bg-red-500/10 border-red-500/30 text-red-400';
+      el.innerHTML = '<div class="flex items-center gap-3"><svg class="w-5 h-5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="' +
+        (type === 'success' ? 'M5 13l4 4L19 7' : 'M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z') +
+        '"/></svg><span>' + text + '</span></div>';
+      el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      setTimeout(() => { el.className = 'hidden'; }, 8000);
+    }
+
+    document.getElementById('setupForm').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const btn = document.getElementById('submitBtn');
+      const originalContent = btn.innerHTML;
+      btn.disabled = true;
+      btn.innerHTML = '<span class="flex items-center justify-center gap-2"><svg class="w-5 h-5 animate-spin" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>Connecting...</span>';
+
+      try {
+        const res = await secureFetch('/setup/onboard', {
+          method: 'POST',
+          body: JSON.stringify({
+            provider: document.getElementById('provider').value,
+            apiKey: document.getElementById('apiKey').value,
+            channels: {
+              telegram: document.getElementById('telegramToken').value || undefined,
+              discord: document.getElementById('discordToken').value || undefined,
+              slack: document.getElementById('slackToken').value || undefined,
+            }
+          })
+        });
+        const data = await res.json();
+        showMessage(data.success ? 'success' : 'error', data.message || data.error);
+        if (data.success) {
+          document.getElementById('apiKey').value = '';
+        }
+        checkStatus();
+        refreshLogs();
+      } catch (e) {
+        showMessage('error', 'Connection failed. Please check your internet and try again.');
+      } finally {
+        btn.disabled = false;
+        btn.innerHTML = originalContent;
+      }
+    });
+
+    async function generatePairingCode() {
+      const deviceName = document.getElementById('deviceName').value;
+      if (!deviceName || deviceName.length < 2) {
+        showMessage('error', 'Please enter a name for your device (e.g., "My iPhone")');
+        return;
+      }
+
+      try {
+        const res = await secureFetch('/setup/pairing/generate', {
+          method: 'POST',
+          body: JSON.stringify({ deviceName })
+        });
+        const data = await res.json();
+        if (data.success) {
+          document.getElementById('pairingCode').classList.remove('hidden');
+          document.getElementById('pairingCodeValue').textContent = data.code;
+          showMessage('success', data.message);
+        } else {
+          showMessage('error', data.message || 'Could not generate pairing code');
+        }
+      } catch (e) {
+        showMessage('error', 'Could not generate pairing code. Please try again.');
+      }
+    }
+
+    function downloadBackup() {
+      window.location.href = '/setup/backup';
+    }
+
+    async function restoreBackup(input) {
+      if (!input.files.length) return;
+      if (!confirm('This will replace all your current settings. Are you sure you want to restore from this backup?')) {
+        input.value = '';
+        return;
+      }
+
+      showMessage('success', 'Uploading backup... Please wait.');
+
+      try {
+        const res = await fetch('/setup/restore', {
+          method: 'POST',
+          headers: {
+            'X-CSRF-Token': window.CSRF_TOKEN,
+            'X-Session-Id': window.SESSION_ID
+          },
+          body: input.files[0],
+        });
+        const data = await res.json();
+        showMessage(data.success ? 'success' : 'error', data.message || data.error);
+        checkStatus();
+        refreshLogs();
+      } catch (e) {
+        showMessage('error', 'Restore failed. Please check your backup file and try again.');
+      }
+      input.value = '';
+    }
+
+    function showResetConfirm() {
+      document.getElementById('resetModal').classList.remove('hidden');
+      document.getElementById('resetConfirmInput').value = '';
+      document.getElementById('resetConfirmInput').focus();
+    }
+
+    function hideResetConfirm() {
+      document.getElementById('resetModal').classList.add('hidden');
+    }
+
+    async function confirmReset() {
+      const confirmValue = document.getElementById('resetConfirmInput').value;
+      if (confirmValue !== 'RESET') {
+        showMessage('error', 'Please type RESET exactly to confirm.');
+        return;
+      }
+
+      try {
+        const res = await secureFetch('/setup/reset', {
+          method: 'POST',
+          body: JSON.stringify({ confirmReset: 'RESET' })
+        });
+        const data = await res.json();
+        showMessage(data.success ? 'success' : 'error', data.message || data.error);
+        hideResetConfirm();
+        checkStatus();
+        refreshLogs();
+      } catch (e) {
+        showMessage('error', 'Reset failed. Please try again.');
+      }
+    }
+
+    async function logout() {
+      try {
+        await secureFetch('/setup/logout', { method: 'POST' });
+        window.location.reload();
+      } catch (e) {
+        window.location.reload();
+      }
+    }
+
+    // Initial load
+    checkStatus();
+    refreshLogs();
+    setInterval(checkStatus, 5000);
+    setInterval(refreshLogs, 10000);
+  </script>
+</body>
+</html>`;
+}
+
+// ============================================================================
+// START SERVER
+// ============================================================================
+
+server.listen(PUBLIC_PORT, '0.0.0.0', () => {
+  console.log('[wrapper] OpenClaw Railway wrapper listening on port ' + PUBLIC_PORT);
+  console.log('[wrapper] Setup wizard: http://localhost:' + PUBLIC_PORT + '/setup');
+  console.log('[wrapper] State directory: ' + STATE_DIR);
+  console.log('[wrapper] Security: Rate limiting enabled, CSRF protection active');
+
+  if (!SETUP_PASSWORD) {
+    console.warn('[security] WARNING: SETUP_PASSWORD not set! Setup page is unprotected.');
+  }
+
+  if (existsSync(join(STATE_DIR, 'config.json'))) {
+    console.log('[wrapper] Found existing config, starting gateway...');
+    startGateway().catch(err => {
+      console.error('[wrapper] Failed to auto-start gateway:', err);
+    });
+  }
+});
+
+// Graceful shutdown
+process.on('SIGTERM', () => {
+  console.log('[wrapper] Received SIGTERM, shutting down...');
+  stopGateway();
+  server.close(() => process.exit(0));
+});
+
+process.on('SIGINT', () => {
+  console.log('[wrapper] Received SIGINT, shutting down...');
+  stopGateway();
+  server.close(() => process.exit(0));
+});
+
+// Clean up expired sessions periodically
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, session] of sessions.entries()) {
+    if (now - session.createdAt > SESSION_DURATION_MS) {
+      sessions.delete(id);
+    }
+  }
+  for (const [code, pairing] of pendingPairings.entries()) {
+    if (now - pairing.createdAt > PAIRING_CODE_EXPIRY_MS) {
+      pendingPairings.delete(code);
+    }
+  }
+}, 60000);

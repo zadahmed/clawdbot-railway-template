@@ -1,0 +1,34 @@
+{
+  "name": "clawdbot-railway-template",
+  "version": "1.0.0",
+  "description": "1-click Railway deployment template for OpenClaw AI assistant",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "dev": "node src/server.js",
+    "start": "node src/server.js",
+    "lint": "node -c src/server.js",
+    "smoke": "node scripts/smoke.js"
+  },
+  "dependencies": {
+    "express": "^5.1.0",
+    "http-proxy": "^1.18.1",
+    "tar": "^7.5.4"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/YOUR_USERNAME/clawdbot-railway-template"
+  },
+  "keywords": [
+    "openclaw",
+    "clawdbot",
+    "railway",
+    "ai-assistant",
+    "claude",
+    "openai"
+  ],
+  "license": "MIT"
+}

@@ -1,10 +1,15 @@
 [build]
-builder = "DOCKERFILE"
-dockerfilePath = "Dockerfile"
+builder = "dockerfile"
 
 [deploy]
-startCommand = "pnpm run start"
-healthcheckPath = "/health"
+healthcheckPath = "/setup/healthz"
 healthcheckTimeout = 300
-restartPolicyType = "ON_FAILURE"
-restartPolicyMaxRetries = 10
+restartPolicyType = "on_failure"
+
+[[mounts]]
+mount = "/data"
+
+[variables]
+PORT = "8080"
+OPENCLAW_STATE_DIR = "/data/.openclaw"
+OPENCLAW_WORKSPACE_DIR = "/data/workspace"
