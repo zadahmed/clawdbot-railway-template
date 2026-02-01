@@ -42,10 +42,15 @@ RUN pnpm ui:install && pnpm ui:build
 FROM node:22-bookworm
 ENV NODE_ENV=production
 
+# Base deps + Homebrew build deps (for skill installs that use brew)
 RUN apt-get update \
   && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
+    build-essential \
+    procps \
+    file \
+    git \
   && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -63,8 +68,26 @@ RUN printf '%s\n' '#!/usr/bin/env bash' 'exec node /openclaw/dist/entry.js "$@"'
 
 COPY src ./src
 
+# Homebrew (for openclaw skills install): must run as non-root on Linux
+RUN useradd -m -s /bin/bash linuxbrew \
+  && su - linuxbrew -c 'NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"' \
+  && echo 'eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"' >> /home/linuxbrew/.bashrc
+ENV PATH="/home/linuxbrew/.linuxbrew/bin:/home/linuxbrew/.linuxbrew/sbin:${PATH}"
+
+# gosu: drop root for entrypoint so /data volume can be chowned, then run app as linuxbrew
+RUN GOSU_VERSION=1.16 \
+  && curl -sSL -o /usr/local/bin/gosu "https://github.com/tianon/gosu/releases/download/${GOSU_VERSION}/gosu-$(dpkg --print-architecture)" \
+  && chmod +x /usr/local/bin/gosu
+
+COPY scripts/entrypoint.sh /app/scripts/entrypoint.sh
+RUN chmod +x /app/scripts/entrypoint.sh
+
+# App and openclaw readable by linuxbrew; entrypoint runs as root, chowns /data, then exec as linuxbrew
+RUN chown -R linuxbrew:linuxbrew /app /openclaw
+
 # The wrapper listens on this port.
 ENV OPENCLAW_PUBLIC_PORT=8080
 ENV PORT=8080
 EXPOSE 8080
+ENTRYPOINT ["/app/scripts/entrypoint.sh"]
 CMD ["node", "src/server.js"]
