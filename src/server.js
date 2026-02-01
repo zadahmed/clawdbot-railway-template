@@ -607,6 +607,9 @@ app.post('/setup/onboard', requireAuth, validateCSRF, async (req, res) => {
         openclawConfig.gateway.auth.token = gatewayToken;
         // Trust our wrapper proxy so gateway accepts X-Forwarded-* and treats clients correctly (any public URL)
         openclawConfig.gateway.trustedProxies = ['127.0.0.1', '::1'];
+        // When behind reverse proxy (e.g. Railway): use token-only auth so dashboard works without device pairing
+        if (!openclawConfig.gateway.controlUi) openclawConfig.gateway.controlUi = {};
+        openclawConfig.gateway.controlUi.allowInsecureAuth = true;
         // Set default model to the provider the user configured (avoids "No API key for anthropic")
         const primaryModel = config.primaryModel;
         if (primaryModel) {
@@ -2239,8 +2242,10 @@ server.listen(PUBLIC_PORT, '0.0.0.0', () => {
         if (openclawConfig.gateway) {
           if (!openclawConfig.gateway.mode) openclawConfig.gateway.mode = 'local';
           if (!openclawConfig.gateway.trustedProxies?.length) openclawConfig.gateway.trustedProxies = ['127.0.0.1', '::1'];
+          if (!openclawConfig.gateway.controlUi) openclawConfig.gateway.controlUi = {};
+          openclawConfig.gateway.controlUi.allowInsecureAuth = true;
           writeFileSync(openclawJsonPath, JSON.stringify(openclawConfig, null, 2), { mode: 0o600 });
-          console.log('[wrapper] Set gateway.mode and trustedProxies for proxy detection');
+          console.log('[wrapper] Set gateway.mode, trustedProxies, and controlUi.allowInsecureAuth for proxy/dashboard');
         }
       }
     } catch (e) {}
