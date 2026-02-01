@@ -68,11 +68,14 @@ const pendingPairings = new Map(); // code -> { deviceName, ip, createdAt, appro
 // Gateway token management
 const TOKEN_FILE = join(STATE_DIR, 'gateway.token');
 let gatewayToken = process.env.OPENCLAW_GATEWAY_TOKEN || '';
+/** True when token was loaded from env or existing file (not newly created). */
+let hasExistingGatewayToken = !!process.env.OPENCLAW_GATEWAY_TOKEN;
 
 function loadOrCreateToken() {
   if (gatewayToken) return gatewayToken;
   if (existsSync(TOKEN_FILE)) {
     gatewayToken = readFileSync(TOKEN_FILE, 'utf-8').trim();
+    hasExistingGatewayToken = true;
   } else {
     gatewayToken = randomBytes(32).toString('hex');
     writeFileSync(TOKEN_FILE, gatewayToken, { mode: 0o600 });
@@ -2227,8 +2230,10 @@ server.listen(PUBLIC_PORT, '0.0.0.0', () => {
     console.warn('[security] WARNING: SETUP_PASSWORD not set! Setup page is unprotected.');
   }
 
-  if (existsSync(join(STATE_DIR, 'config.json'))) {
-    console.log('[wrapper] Found existing config, starting gateway...');
+  // Resume dashboard session when already configured and we have a proper gateway token
+  const hasConfig = existsSync(join(STATE_DIR, 'config.json'));
+  if (hasConfig && hasExistingGatewayToken) {
+    console.log('[wrapper] Existing config and gateway token found, resuming dashboard session...');
     // Ensure gateway.trustedProxies is set for existing configs (wrapper runs in front; any public URL)
     try {
       const openclawJsonPath = join(STATE_DIR, 'openclaw.json');
@@ -2245,6 +2250,8 @@ server.listen(PUBLIC_PORT, '0.0.0.0', () => {
     startGateway().catch(err => {
       console.error('[wrapper] Failed to auto-start gateway:', err);
     });
+  } else if (hasConfig && !hasExistingGatewayToken) {
+    console.log('[wrapper] Existing config found but no persisted gateway token; complete setup at /setup to start the gateway.');
   }
 });
 
